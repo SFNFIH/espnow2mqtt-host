@@ -1,5 +1,8 @@
 # ESP32-S3 协调器固件
 
+> **这篇讲"为什么这么写"。** 想知道"怎么烧起来、怎么手动测 USB 协议"，
+> 看 [firmware/coordinator/README.md](../firmware/coordinator/README.md)。
+
 源码：**`firmware/coordinator/`**，391 行 `main.c` + 84 行 `usb_host_link.c`。
 
 它的工作只有一句话：**把 ESP-NOW 帧和 USB 上的 NDJSON 互相翻译，

@@ -25,6 +25,7 @@ HA 集成（插件）在：**[espnow2mqtt-ha](https://github.com/SFNFIH/espnow2m
 |------|------|
 | 从零跑通主机侧（烧 S3 → 跑 Bridge → 验证 MQTT → 加第一个设备） | [docs/quickstart.md](docs/quickstart.md) |
 | 搞懂整条链路每一跳做了什么、状态和命令怎么流动 | [docs/architecture.md](docs/architecture.md) |
+| 把 S3 固件烧起来、手动测 USB 协议 | [firmware/coordinator/README.md](firmware/coordinator/README.md) |
 | 搞懂 S3 固件（peer 表、配网、ACK/重传、离线判定） | [docs/coordinator.md](docs/coordinator.md) |
 | 搞懂 Bridge（状态合并、caps 推断、slug、discovery） | [docs/bridge.md](docs/bridge.md) |
 | 查 USB 上的每一种 JSON 行（含手工调试命令） | [docs/usb-protocol.md](docs/usb-protocol.md) |
@@ -118,7 +119,7 @@ mosquitto_pub -t espnow2mqtt/bridge/request/permit_join -m 60
 
 ```
 components/en2m/           # 协调器依赖的 mesh 组件
-firmware/coordinator/      # ESP32-S3 固件工程
+firmware/coordinator/      # ESP32-S3 固件工程（目录里有自己的 README）
 espnow2mqtt/               # Python Bridge 包
 addon/                     # HA Add-on
 docker-compose.yml

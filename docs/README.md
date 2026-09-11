@@ -30,6 +30,7 @@
 |---|---|
 | 先跑起来 | [quickstart.md](quickstart.md) |
 | 搞懂整条链路每一跳做了什么 | [architecture.md](architecture.md) |
+| 把 S3 固件烧起来、手动测 USB 协议 | [../firmware/coordinator/README.md](../firmware/coordinator/README.md) |
 | 搞懂 S3 固件（peer 表、配网、ACK、离线判定） | [coordinator.md](coordinator.md) |
 | 搞懂 Bridge（状态合并、caps、discovery、slug） | [bridge.md](bridge.md) |
 | 查 USB 上的每一种 JSON 行 | [usb-protocol.md](usb-protocol.md) |
