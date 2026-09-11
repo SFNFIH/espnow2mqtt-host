@@ -2,11 +2,12 @@
 
 这里是**主机侧**的完整文档：ESP32-S3 协调器固件 + Python Bridge + HA Add-on。
 
-- C3 终端设备固件和 `en2m` 库文档在
-  **[espnow2mqtt-device](https://github.com/SFNFIH/espnow2mqtt-device)**
-  （那边的 [`docs/`](https://github.com/SFNFIH/espnow2mqtt-device/tree/main/docs)
-  是整套系统里最厚的一份，库的架构、状态流转、回调契约都在那）
-- HA 集成在 **[espnow2mqtt-ha](https://github.com/SFNFIH/espnow2mqtt-ha)**
+另外两个仓库各有一份同样详细的 `docs/`：
+
+| 仓库 | 内容 | 什么时候去那边 |
+|---|---|---|
+| [espnow2mqtt-device](https://github.com/SFNFIH/espnow2mqtt-device/tree/main/docs) | C3 设备固件 + `en2m` 组件 | 查数据模型、回调契约、每个上报字段是怎么算出来的、160 字节降级、NVS 持久化。**这是整套系统里最厚的一份** |
+| [espnow2mqtt-ha](https://github.com/SFNFIH/espnow2mqtt-ha/tree/main/docs) | HA 自定义集成 | 查 `caps` → HA 实体的映射、单位换算、自动化写法 |
 
 ## 这个仓库在整条链路里的位置
 
