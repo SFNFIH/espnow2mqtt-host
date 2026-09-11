@@ -1,9 +1,15 @@
 # `en2m` — ESP-NOW interaction layer
 
-An ESP-IDF component that turns an ESP32-C3 (or any ESP-NOW capable target)
-into a mesh device the host coordinator can talk to. The split follows
-ESP-Matter: the component owns the data model and the transport, the
-application owns the hardware.
+An ESP-IDF component that puts an ESP-NOW capable target on the espnow2mqtt
+mesh, either as an end device exposing clusters or as the coordinator bridging
+the mesh to the host. The split follows ESP-Matter: the component owns the data
+model and the transport, the application owns the hardware.
+
+The same copy of this component is vendored into both
+[espnow2mqtt-device](https://github.com/SFNFIH/espnow2mqtt-device) (ESP32-C3
+end devices, which use everything below) and
+[espnow2mqtt-host](https://github.com/SFNFIH/espnow2mqtt-host) (the ESP32-S3
+coordinator, which uses only the mesh transport and the events).
 
 | Layer | In this component? |
 |-------|--------------------|
