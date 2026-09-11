@@ -7,3 +7,10 @@ build/
 data/
 .DS_Store
 *.tar.gz
+.vscode/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+firmware/**/build/
+firmware/**/sdkconfig

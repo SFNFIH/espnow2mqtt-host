@@ -1,15 +1,25 @@
+/**
+ * USB coordinator — bridges the ESP-NOW mesh to the host over NDJSON.
+ *
+ * The coordinator has no clusters of its own, so it uses the transport layer
+ * directly. Frames arrive on the en2m task rather than in the ESP-NOW
+ * callback, downlinks are retried by the component, and the housekeeping that
+ * used to sit in a polling task now hangs off an esp_timer and en2m events.
+ */
 #include <stdio.h>
 #include <string.h>
 
 #include "cJSON.h"
-#include "en2m_mesh.h"
+#include "en2m.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "usb_host_link.h"
 
 static const char *TAG = "coord";
+
+#define HOUSEKEEPING_PERIOD_US (1000 * 1000)
+#define HELLO_PERIOD_MS 30000
+#define PEER_SWEEP_PERIOD_MS 2000
 
 typedef struct {
     bool used;
@@ -49,6 +59,20 @@ static void usb_log(const char *msg)
     cJSON_Delete(o);
 }
 
+static void usb_emit_ack(const char *mac, uint16_t id, bool ok, const char *error)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "ack");
+    cJSON_AddStringToObject(o, "mac", mac);
+    cJSON_AddNumberToObject(o, "id", id);
+    cJSON_AddBoolToObject(o, "ok", ok);
+    if (error != NULL) {
+        cJSON_AddStringToObject(o, "error", error);
+    }
+    usb_emit_json(o);
+    cJSON_Delete(o);
+}
+
 static int find_peer(const uint8_t mac[6])
 {
     for (int i = 0; i < EN2M_MAX_ROUTES; i++) {
@@ -80,7 +104,7 @@ static void emit_hello(void)
 {
     uint8_t mac[6];
     char macs[18];
-    en2m_self_mac(mac);
+    en2m_get_self_mac(mac);
     en2m_mac_to_str(mac, macs);
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "hello");
@@ -191,6 +215,32 @@ static void on_mesh_log(const char *msg, void *user)
     usb_log(msg);
 }
 
+/** The component retried this command and never heard back; tell the host. */
+static void on_en2m_event(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+
+    switch (event_id) {
+    case EN2M_EVENT_ACK_TIMEOUT: {
+        const en2m_event_ack_t *ack = data;
+        char macs[18];
+        en2m_mac_to_str(ack->mac, macs);
+        usb_emit_ack(macs, ack->transaction_id, false, "timeout");
+        break;
+    }
+    case EN2M_EVENT_RX_DROPPED: {
+        const en2m_event_dropped_t *dropped = data;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "rx_dropped=%u", (unsigned)dropped->total);
+        usb_log(msg);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void handle_host_line(const char *line, void *user)
 {
     (void)user;
@@ -259,7 +309,8 @@ static void handle_host_line(const char *line, void *user)
         if (!cJSON_IsString(macj) || !en2m_mac_from_str(macj->valuestring, mac)) {
             usb_log("bad mac");
         } else {
-            uint16_t id = cJSON_IsNumber(idj) ? (uint16_t)idj->valueint : 0;
+            /* A non-zero id makes the component retry until the node acks. */
+            uint16_t id = cJSON_IsNumber(idj) ? (uint16_t)idj->valueint : en2m_next_cmd_id();
             char *ps = payload ? cJSON_PrintUnformatted(payload) : NULL;
             esp_err_t err = en2m_send_downlink(
                 mac, id, (const uint8_t *)(ps ? ps : "{}"),
@@ -268,14 +319,7 @@ static void handle_host_line(const char *line, void *user)
                 cJSON_free(ps);
             }
             if (err != ESP_OK) {
-                cJSON *o = cJSON_CreateObject();
-                cJSON_AddStringToObject(o, "type", "ack");
-                cJSON_AddStringToObject(o, "mac", macj->valuestring);
-                cJSON_AddNumberToObject(o, "id", id);
-                cJSON_AddBoolToObject(o, "ok", false);
-                cJSON_AddStringToObject(o, "error", "send_fail");
-                usb_emit_json(o);
-                cJSON_Delete(o);
+                usb_emit_ack(macj->valuestring, id, false, "send_fail");
             }
         }
     } else {
@@ -285,48 +329,44 @@ static void handle_host_line(const char *line, void *user)
     cJSON_Delete(doc);
 }
 
-static void mesh_task(void *arg)
+/** Pairing window, peer expiry and the periodic hello for the host. */
+static void housekeeping(void *arg)
 {
+    static int64_t last_sweep;
+    static int64_t last_hello;
+    int64_t now = millis();
+
     (void)arg;
-    int64_t last_check = 0;
-    int64_t last_hello = 0;
-    while (1) {
-        en2m_mesh_loop();
 
-        if (en2m_pairing() && millis() >= s_pair_until_ms) {
-            en2m_set_pairing(false);
-            usb_log("pairing_disabled");
-        }
+    if (en2m_get_pairing() && now >= s_pair_until_ms) {
+        en2m_set_pairing(false);
+        usb_log("pairing_disabled");
+    }
 
-        int64_t now = millis();
-        if (now - last_check > 2000) {
-            last_check = now;
-            for (int i = 0; i < EN2M_MAX_ROUTES; i++) {
-                if (!s_peers[i].used) {
-                    continue;
-                }
-                if (now - s_peers[i].last_ms > EN2M_OFFLINE_MS) {
-                    emit_device(&s_peers[i], "offline");
-                    s_peers[i].used = false;
-                }
+    if (now - last_sweep > PEER_SWEEP_PERIOD_MS) {
+        last_sweep = now;
+        for (int i = 0; i < EN2M_MAX_ROUTES; i++) {
+            if (s_peers[i].used && now - s_peers[i].last_ms > EN2M_OFFLINE_MS) {
+                emit_device(&s_peers[i], "offline");
+                s_peers[i].used = false;
             }
         }
-        if (now - last_hello > 30000) {
-            last_hello = now;
-            emit_hello();
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (now - last_hello > HELLO_PERIOD_MS) {
+        last_hello = now;
+        emit_hello();
     }
 }
 
 void app_main(void)
 {
-    memset(s_peers, 0, sizeof(s_peers));
-    ESP_LOGI(TAG, "espnow2mqtt coordinator (ESP-IDF)");
-
-    ESP_ERROR_CHECK(usb_host_link_start(handle_host_line, NULL));
-
-    en2m_app_config_t cfg = {
+    const esp_timer_create_args_t timer_args = {
+        .callback = housekeeping,
+        .name = "coord_housekeeping",
+    };
+    esp_timer_handle_t timer;
+    en2m_config_t cfg = {
         .role = EN2M_ROLE_COORDINATOR,
         .model = "s3-coord",
         .name = "coordinator",
@@ -334,12 +374,18 @@ void app_main(void)
         .channel = EN2M_WIFI_CHANNEL,
         .on_uplink = on_uplink,
         .on_log = on_mesh_log,
-        .user_ctx = NULL,
     };
+
+    memset(s_peers, 0, sizeof(s_peers));
+    ESP_LOGI(TAG, "espnow2mqtt coordinator (ESP-IDF)");
+
+    ESP_ERROR_CHECK(usb_host_link_start(handle_host_line, NULL));
+    ESP_ERROR_CHECK(en2m_event_handler_register(EN2M_EVENT_ANY, on_en2m_event, NULL));
     ESP_ERROR_CHECK(en2m_mesh_init(&cfg));
 
     emit_hello();
     usb_log("coordinator ready (esp-idf mesh)");
 
-    xTaskCreate(mesh_task, "mesh", 8192, NULL, 4, NULL);
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, HOUSEKEEPING_PERIOD_US));
 }

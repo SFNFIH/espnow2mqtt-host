@@ -213,9 +213,20 @@ class Bridge:
         elif mtype == "state":
             self._on_state(msg)
         elif mtype == "ack":
-            LOG.info("ack: %s", msg)
+            self._on_ack(msg)
         else:
             LOG.debug("ignored: %s", msg)
+
+    def _on_ack(self, msg: dict[str, Any]) -> None:
+        if msg.get("ok"):
+            LOG.debug("ack: %s", msg)
+            return
+        LOG.warning(
+            "command %s to %s failed: %s",
+            msg.get("id"),
+            msg.get("mac"),
+            msg.get("error") or "unknown",
+        )
 
     def _ensure_device(self, mac: str) -> Device:
         if mac not in self.devices:

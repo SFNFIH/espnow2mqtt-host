@@ -46,4 +46,50 @@ menu "ESP-NOW Mesh (en2m)"
         range 10000 600000
         default 90000
 
+    config EN2M_HEARTBEAT_MS
+        int "Heartbeat interval (ms) for leaf/router"
+        range 5000 600000
+        default 30000
+
+    config EN2M_QUEUE_LEN
+        int "Depth of the en2m task queue"
+        range 4 32
+        default 8
+        help
+            Received frames, deferred work and ISR attribute updates share this
+            queue. Each slot holds one full frame, so raising it costs about
+            260 bytes per entry.
+
+    config EN2M_MAX_PENDING
+        int "Concurrent unacknowledged downlinks"
+        range 1 16
+        default 4
+        help
+            Coordinator only. Each slot buffers one frame for retransmission.
+
+    config EN2M_CMD_RETRIES
+        int "Downlink retries before giving up"
+        range 0 10
+        default 3
+
+    config EN2M_CMD_RETRY_MS
+        int "Delay between downlink retries (ms)"
+        range 50 5000
+        default 400
+
+    config EN2M_MAX_ENDPOINTS
+        int "Endpoints per device"
+        range 1 16
+        default 4
+
+    config EN2M_MAX_CLUSTERS_PER_ENDPOINT
+        int "Clusters per endpoint"
+        range 1 16
+        default 8
+
+    config EN2M_MAX_ATTRIBUTES_PER_CLUSTER
+        int "Attributes per cluster"
+        range 1 16
+        default 6
+
 endmenu

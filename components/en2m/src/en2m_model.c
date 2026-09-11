@@ -1,199 +1,58 @@
 /**
  * @file en2m_model.c
- * @brief Endpoint / cluster interaction layer (no hardware drivers).
+ * @brief Lifecycle, command decoding and state reporting.
  *
- * Uplink JSON stays compact (EN2M_DATA_MAX): flat HA aliases + caps +
- * a short cluster name list. Nested attribute dumps are omitted on-air.
+ * Everything here runs on the en2m task: command dispatch, the read refresh
+ * that feeds pull-style sensors, report scheduling and the NVS write-back.
+ * Applications only supply callbacks.
  */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "cJSON.h"
-#include "en2m_model.h"
+#include "en2m_priv.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
 static const char *TAG = "en2m_model";
 
-typedef struct {
-    bool present;
-    en2m_on_off_driver_t on_off;
-    en2m_level_driver_t level;
-    en2m_color_control_driver_t color;
-    en2m_boolean_state_driver_t boolean_state;
-    en2m_occupancy_driver_t occupancy;
-    en2m_illuminance_driver_t illuminance;
-    en2m_temperature_driver_t temperature;
-    en2m_humidity_driver_t humidity;
-    en2m_pressure_driver_t pressure;
-    en2m_electrical_power_driver_t electrical;
-    en2m_fan_control_driver_t fan;
-    en2m_window_covering_driver_t cover;
-    en2m_door_lock_driver_t lock;
-    en2m_thermostat_driver_t thermostat;
-    en2m_smoke_co_driver_t smoke_co;
-} en2m_endpoint_clusters_t;
-
-struct en2m_endpoint {
-    bool used;
-    uint8_t id;
-    en2m_endpoint_clusters_t clusters;
-};
+#define EN2M_REPORT_INTERVAL_LEAF_MS 30000
+#define EN2M_REPORT_INTERVAL_MAINS_MS 15000
+#define EN2M_MIN_REPORT_INTERVAL_MS 1000
+#define EN2M_PERSIST_FLUSH_MS 5000
 
 static struct {
+    bool configured;
     bool started;
-    en2m_endpoint_t endpoints[EN2M_MAX_ENDPOINTS];
-    int64_t last_report_us;
-    uint32_t report_interval_ms;
+    en2m_device_config_t cfg;
+    int64_t last_report_ms;
+    int64_t next_report_ms; /* 0 = nothing scheduled */
+    int64_t last_persist_ms;
+    int64_t next_identify_ms;
 } s_model;
 
-static int64_t en2m_model_now_us(void)
+static int64_t en2m_now_ms(void)
 {
-    return esp_timer_get_time();
+    return esp_timer_get_time() / 1000;
 }
 
-static en2m_endpoint_t *en2m_endpoint_find(uint8_t endpoint_id)
+const en2m_device_config_t *en2m_model_config(void)
 {
-    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
-        if (s_model.endpoints[i].used && s_model.endpoints[i].id == endpoint_id) {
-            return &s_model.endpoints[i];
-        }
-    }
-    return NULL;
+    return s_model.configured ? &s_model.cfg : NULL;
 }
 
-en2m_endpoint_t *en2m_endpoint_create(uint8_t endpoint_id)
+bool en2m_is_started(void)
 {
-    if (endpoint_id == 0 || endpoint_id == 255) {
-        ESP_LOGE(TAG, "invalid endpoint id %u", endpoint_id);
-        return NULL;
-    }
-    if (en2m_endpoint_find(endpoint_id) != NULL) {
-        ESP_LOGE(TAG, "endpoint %u already exists", endpoint_id);
-        return NULL;
-    }
-
-    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
-        if (!s_model.endpoints[i].used) {
-            memset(&s_model.endpoints[i], 0, sizeof(s_model.endpoints[i]));
-            s_model.endpoints[i].used = true;
-            s_model.endpoints[i].id = endpoint_id;
-            return &s_model.endpoints[i];
-        }
-    }
-
-    ESP_LOGE(TAG, "no free endpoint slot");
-    return NULL;
+    return s_model.started;
 }
 
-#define EN2M_ADD_DRIVER(field, required_fn)                                                                    \
-    do {                                                                                                       \
-        ESP_RETURN_ON_FALSE(ep != NULL && driver != NULL && (required_fn), ESP_ERR_INVALID_ARG, TAG, "bad args"); \
-        ep->clusters.present = true;                                                                           \
-        ep->clusters.field = *driver;                                                                          \
-        return ESP_OK;                                                                                         \
-    } while (0)
+/* ---- textual value mappings shared with the host bridge ---- */
 
-esp_err_t en2m_endpoint_add_on_off(en2m_endpoint_t *ep, const en2m_on_off_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(on_off, driver->get != NULL);
-}
-
-esp_err_t en2m_endpoint_add_level_control(en2m_endpoint_t *ep, const en2m_level_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(level, driver->get_level != NULL);
-}
-
-esp_err_t en2m_endpoint_add_color_control(en2m_endpoint_t *ep, const en2m_color_control_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(color, driver->get_color_temp != NULL);
-}
-
-esp_err_t en2m_endpoint_add_boolean_state(en2m_endpoint_t *ep, const en2m_boolean_state_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(boolean_state, driver->get != NULL);
-}
-
-esp_err_t en2m_endpoint_add_occupancy(en2m_endpoint_t *ep, const en2m_occupancy_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(occupancy, driver->get_occupied != NULL);
-}
-
-esp_err_t en2m_endpoint_add_illuminance(en2m_endpoint_t *ep, const en2m_illuminance_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(illuminance, driver->get_lux != NULL);
-}
-
-esp_err_t en2m_endpoint_add_temperature(en2m_endpoint_t *ep, const en2m_temperature_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(temperature, driver->get_measured_value != NULL);
-}
-
-esp_err_t en2m_endpoint_add_humidity(en2m_endpoint_t *ep, const en2m_humidity_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(humidity, driver->get_measured_value != NULL);
-}
-
-esp_err_t en2m_endpoint_add_pressure(en2m_endpoint_t *ep, const en2m_pressure_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(pressure, driver->get_hpa != NULL);
-}
-
-esp_err_t en2m_endpoint_add_electrical_power(en2m_endpoint_t *ep, const en2m_electrical_power_driver_t *driver)
-{
-    ESP_RETURN_ON_FALSE(ep != NULL && driver != NULL, ESP_ERR_INVALID_ARG, TAG, "bad args");
-    ep->clusters.present = true;
-    ep->clusters.electrical = *driver;
-    return ESP_OK;
-}
-
-esp_err_t en2m_endpoint_add_fan_control(en2m_endpoint_t *ep, const en2m_fan_control_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(fan, driver->get_mode != NULL);
-}
-
-esp_err_t en2m_endpoint_add_window_covering(en2m_endpoint_t *ep, const en2m_window_covering_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(cover, driver->get_position != NULL);
-}
-
-esp_err_t en2m_endpoint_add_door_lock(en2m_endpoint_t *ep, const en2m_door_lock_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(lock, driver->get_locked != NULL);
-}
-
-esp_err_t en2m_endpoint_add_thermostat(en2m_endpoint_t *ep, const en2m_thermostat_driver_t *driver)
-{
-    EN2M_ADD_DRIVER(thermostat, driver->get_system_mode != NULL);
-}
-
-esp_err_t en2m_endpoint_add_smoke_co(en2m_endpoint_t *ep, const en2m_smoke_co_driver_t *driver)
-{
-    ESP_RETURN_ON_FALSE(ep != NULL && driver != NULL, ESP_ERR_INVALID_ARG, TAG, "bad args");
-    ep->clusters.present = true;
-    ep->clusters.smoke_co = *driver;
-    return ESP_OK;
-}
-
-static void en2m_model_append_caps(cJSON *caps, const char *name)
-{
-    cJSON *item = NULL;
-    cJSON_ArrayForEach(item, caps)
-    {
-        if (cJSON_IsString(item) && strcmp(item->valuestring, name) == 0) {
-            return;
-        }
-    }
-    cJSON_AddItemToArray(caps, cJSON_CreateString(name));
-}
-
-static const char *en2m_fan_mode_str(en2m_fan_mode_t mode)
+static const char *en2m_fan_mode_str(uint8_t mode)
 {
     switch (mode) {
-    case EN2M_FAN_OFF:
-        return "off";
     case EN2M_FAN_LOW:
         return "low";
     case EN2M_FAN_MEDIUM:
@@ -206,6 +65,7 @@ static const char *en2m_fan_mode_str(en2m_fan_mode_t mode)
         return "auto";
     case EN2M_FAN_SMART:
         return "smart";
+    case EN2M_FAN_OFF:
     default:
         return "off";
     }
@@ -213,7 +73,7 @@ static const char *en2m_fan_mode_str(en2m_fan_mode_t mode)
 
 static en2m_fan_mode_t en2m_fan_mode_parse(const char *s)
 {
-    if (!s) {
+    if (s == NULL) {
         return EN2M_FAN_OFF;
     }
     if (strcmp(s, "low") == 0) {
@@ -237,7 +97,7 @@ static en2m_fan_mode_t en2m_fan_mode_parse(const char *s)
     return EN2M_FAN_OFF;
 }
 
-static const char *en2m_hvac_mode_str(en2m_thermostat_mode_t mode)
+static const char *en2m_hvac_mode_str(uint8_t mode)
 {
     switch (mode) {
     case EN2M_THERMOSTAT_AUTO:
@@ -256,7 +116,7 @@ static const char *en2m_hvac_mode_str(en2m_thermostat_mode_t mode)
 
 static en2m_thermostat_mode_t en2m_hvac_mode_parse(const char *s)
 {
-    if (!s) {
+    if (s == NULL) {
         return EN2M_THERMOSTAT_OFF;
     }
     if (strcmp(s, "auto") == 0) {
@@ -274,553 +134,1027 @@ static en2m_thermostat_mode_t en2m_hvac_mode_parse(const char *s)
     return EN2M_THERMOSTAT_OFF;
 }
 
-static cJSON *en2m_model_build_report_json(void)
+/* ---- data model helpers ---- */
+
+static bool en2m_model_read(uint8_t endpoint_id, uint16_t cluster_id, uint16_t attribute_id, int64_t *out)
+{
+    en2m_value_t value;
+
+    if (en2m_attribute_get(endpoint_id, cluster_id, attribute_id, &value) != ESP_OK) {
+        return false;
+    }
+    *out = en2m_value_as_int(&value);
+    return true;
+}
+
+/** Endpoint id of the lowest-numbered endpoint carrying @p cluster_id, or 0. */
+static uint8_t en2m_model_endpoint_with(uint16_t cluster_id)
+{
+    uint8_t found = 0;
+
+    en2m_dm_lock();
+    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
+        struct en2m_endpoint *ep = en2m_dm_endpoint_slot(i);
+        if (ep == NULL || !ep->used) {
+            continue;
+        }
+        for (int c = 0; c < EN2M_MAX_CLUSTERS_PER_ENDPOINT; c++) {
+            if (ep->clusters[c].used && ep->clusters[c].id == cluster_id) {
+                if (found == 0 || ep->id < found) {
+                    found = ep->id;
+                }
+                break;
+            }
+        }
+    }
+    en2m_dm_unlock();
+    return found;
+}
+
+/* ---- report serialization ---- */
+
+static void en2m_caps_add(cJSON *caps, const char *name)
+{
+    cJSON *item = NULL;
+
+    cJSON_ArrayForEach(item, caps)
+    {
+        if (cJSON_IsString(item) && strcmp(item->valuestring, name) == 0) {
+            return;
+        }
+    }
+    cJSON_AddItemToArray(caps, cJSON_CreateString(name));
+}
+
+/**
+ * Serialize one cluster into the flat key space the MQTT bridge and the Home
+ * Assistant integration consume. Keys are global, so the lowest endpoint that
+ * owns a cluster wins; multi-endpoint nodes should use distinct clusters.
+ */
+static void en2m_report_cluster(cJSON *root, cJSON *caps, uint8_t ep_id, uint16_t cluster_id)
+{
+    int64_t v = 0;
+    int64_t v2 = 0;
+
+    switch (cluster_id) {
+    case EN2M_CLUSTER_ON_OFF:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_ON_OFF, &v)) {
+            cJSON_AddStringToObject(root, "switch", v ? "ON" : "OFF");
+            en2m_caps_add(caps, "switch");
+        }
+        break;
+
+    case EN2M_CLUSTER_LEVEL_CONTROL:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_CURRENT_LEVEL, &v)) {
+            cJSON_AddNumberToObject(root, "brightness", (double)v);
+            en2m_caps_add(caps, "light");
+        }
+        break;
+
+    case EN2M_CLUSTER_COLOR_CONTROL:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_COLOR_TEMPERATURE_MIREDS, &v)) {
+            cJSON_AddNumberToObject(root, "color_temp", (double)v);
+            cJSON_AddStringToObject(root, "color_mode", "color_temp");
+            en2m_caps_add(caps, "light");
+        }
+        break;
+
+    case EN2M_CLUSTER_BOOLEAN_STATE:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_STATE_VALUE, &v)) {
+            cJSON_AddStringToObject(root, "contact", v ? "ON" : "OFF");
+            en2m_caps_add(caps, "contact");
+        }
+        break;
+
+    case EN2M_CLUSTER_OCCUPANCY:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_OCCUPANCY, &v)) {
+            cJSON_AddStringToObject(root, "occupancy", v ? "ON" : "OFF");
+            en2m_caps_add(caps, "occupancy");
+        }
+        break;
+
+    case EN2M_CLUSTER_ILLUMINANCE:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_MEASURED_VALUE, &v)) {
+            cJSON_AddNumberToObject(root, "illuminance", (double)v);
+            en2m_caps_add(caps, "illuminance");
+        }
+        break;
+
+    case EN2M_CLUSTER_TEMPERATURE_MEASUREMENT:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_MEASURED_VALUE, &v)) {
+            cJSON_AddNumberToObject(root, "temperature", v / 100.0);
+            en2m_caps_add(caps, "temperature");
+        }
+        break;
+
+    case EN2M_CLUSTER_RELATIVE_HUMIDITY:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_MEASURED_VALUE, &v)) {
+            cJSON_AddNumberToObject(root, "humidity", v / 100.0);
+            en2m_caps_add(caps, "humidity");
+        }
+        break;
+
+    case EN2M_CLUSTER_PRESSURE_MEASUREMENT:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_MEASURED_VALUE, &v)) {
+            cJSON_AddNumberToObject(root, "pressure", v / 10.0);
+            en2m_caps_add(caps, "pressure");
+        }
+        break;
+
+    case EN2M_CLUSTER_SMOKE_CO:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_SMOKE_STATE, &v)) {
+            cJSON_AddStringToObject(root, "smoke", v ? "ON" : "OFF");
+            en2m_caps_add(caps, "smoke");
+        }
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_CO_STATE, &v)) {
+            cJSON_AddStringToObject(root, "carbon_monoxide", v ? "ON" : "OFF");
+            en2m_caps_add(caps, "carbon_monoxide");
+        }
+        break;
+
+    case EN2M_CLUSTER_ELECTRICAL_POWER:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_ACTIVE_POWER_MW, &v)) {
+            cJSON_AddNumberToObject(root, "power", v / 1000.0);
+            en2m_caps_add(caps, "power");
+        }
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_ENERGY_MWH, &v)) {
+            cJSON_AddNumberToObject(root, "energy", v / 1000.0);
+            en2m_caps_add(caps, "energy");
+        }
+        break;
+
+    case EN2M_CLUSTER_FAN_CONTROL:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_FAN_MODE, &v)) {
+            cJSON_AddStringToObject(root, "fan_mode", en2m_fan_mode_str((uint8_t)v));
+            en2m_caps_add(caps, "fan");
+        }
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_PERCENT_SETTING, &v)) {
+            cJSON_AddNumberToObject(root, "percentage", (double)v);
+        }
+        break;
+
+    case EN2M_CLUSTER_WINDOW_COVERING:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_CURRENT_POSITION_LIFT_PERCENT, &v)) {
+            cJSON_AddNumberToObject(root, "position", (double)v);
+            cJSON_AddStringToObject(root, "cover", v >= 95 ? "CLOSED" : "OPEN");
+            en2m_caps_add(caps, "cover");
+        }
+        break;
+
+    case EN2M_CLUSTER_DOOR_LOCK:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_LOCK_STATE, &v)) {
+            cJSON_AddStringToObject(root, "lock", v == EN2M_LOCK_LOCKED ? "LOCKED" : "UNLOCKED");
+            en2m_caps_add(caps, "lock");
+        }
+        break;
+
+    case EN2M_CLUSTER_THERMOSTAT:
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_SYSTEM_MODE, &v)) {
+            cJSON_AddStringToObject(root, "hvac_mode", en2m_hvac_mode_str((uint8_t)v));
+            en2m_caps_add(caps, "climate");
+        }
+        if (en2m_model_read(ep_id, cluster_id, EN2M_ATTR_LOCAL_TEMPERATURE, &v2)) {
+            cJSON_AddNumberToObject(root, "current_temperature", v2 / 100.0);
+        }
+        /* Report the setpoint that the active mode is actually chasing. */
+        if (en2m_model_read(ep_id, cluster_id,
+                            (v == EN2M_THERMOSTAT_COOL) ? EN2M_ATTR_OCCUPIED_COOLING_SETPOINT
+                                                        : EN2M_ATTR_OCCUPIED_HEATING_SETPOINT,
+                            &v2)) {
+            cJSON_AddNumberToObject(root, "target_temperature", v2 / 100.0);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/** Assemble the uplink report. @p caps and @p diagnostics trade size for detail. */
+static char *en2m_report_build(bool with_caps, bool with_diagnostics)
 {
     cJSON *root = cJSON_CreateObject();
-    cJSON *caps = cJSON_AddArrayToObject(root, "caps");
-    cJSON *clist = cJSON_AddArrayToObject(root, "clusters");
-    const char *role = "leaf";
-    bool has_level = false;
-    bool has_color = false;
-    bool has_on_off = false;
+    cJSON *caps;
+    char *printed;
+    bool seen[EN2M_MAX_CLUSTERS_PER_ENDPOINT * EN2M_MAX_ENDPOINTS] = {false};
+    uint16_t seen_ids[EN2M_MAX_CLUSTERS_PER_ENDPOINT * EN2M_MAX_ENDPOINTS] = {0};
+    int seen_count = 0;
 
-    if (en2m_get_role() == EN2M_ROLE_ROUTER) {
-        role = "router";
-    } else if (en2m_get_role() == EN2M_ROLE_COORDINATOR) {
-        role = "coordinator";
+    if (root == NULL) {
+        return NULL;
     }
-    cJSON_AddStringToObject(root, "node_role", role);
+    caps = cJSON_CreateArray();
+    if (caps == NULL) {
+        cJSON_Delete(root);
+        return NULL;
+    }
 
-    if (en2m_has_parent()) {
-        uint8_t mac[6];
-        char mac_str[18];
-        en2m_get_parent_mac(mac);
-        en2m_mac_to_str(mac, mac_str);
-        cJSON_AddNumberToObject(root, "path_cost", en2m_get_path_cost());
-        cJSON_AddStringToObject(root, "parent", mac_str);
+    if (with_diagnostics) {
+        const char *role = "leaf";
+        if (en2m_get_role() == EN2M_ROLE_ROUTER) {
+            role = "router";
+        } else if (en2m_get_role() == EN2M_ROLE_COORDINATOR) {
+            role = "coordinator";
+        }
+        cJSON_AddStringToObject(root, "node_role", role);
     }
 
     for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
-        en2m_endpoint_t *ep = &s_model.endpoints[i];
-        if (!ep->used) {
+        struct en2m_endpoint *ep = en2m_dm_endpoint_slot(i);
+        if (ep == NULL || !ep->used) {
             continue;
         }
+        for (int c = 0; c < EN2M_MAX_CLUSTERS_PER_ENDPOINT; c++) {
+            uint16_t cluster_id;
+            bool duplicate = false;
 
-        if (ep->clusters.on_off.get != NULL) {
-            bool on = false;
-            has_on_off = true;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("on_off"));
-            if (ep->clusters.on_off.get(&on, ep->clusters.on_off.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "switch", on ? "ON" : "OFF");
+            if (!ep->clusters[c].used) {
+                continue;
             }
-        }
-
-        if (ep->clusters.level.get_level != NULL) {
-            uint8_t level = 0;
-            has_level = true;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("level"));
-            if (ep->clusters.level.get_level(&level, ep->clusters.level.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "brightness", level);
-                cJSON_AddNumberToObject(root, "level", level);
-            }
-        }
-
-        if (ep->clusters.color.get_color_temp != NULL) {
-            uint16_t mireds = 0;
-            has_color = true;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("color"));
-            if (ep->clusters.color.get_color_temp(&mireds, ep->clusters.color.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "color_temp", mireds);
-                cJSON_AddStringToObject(root, "color_mode", "color_temp");
-            }
-        }
-
-        if (ep->clusters.boolean_state.get != NULL) {
-            bool value = false;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("boolean"));
-            if (ep->clusters.boolean_state.get(&value, ep->clusters.boolean_state.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "contact", value ? "ON" : "OFF");
-            }
-            en2m_model_append_caps(caps, "contact");
-        }
-
-        if (ep->clusters.occupancy.get_occupied != NULL) {
-            bool occ = false;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("occupancy"));
-            if (ep->clusters.occupancy.get_occupied(&occ, ep->clusters.occupancy.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "occupancy", occ ? "ON" : "OFF");
-                cJSON_AddStringToObject(root, "motion", occ ? "ON" : "OFF");
-            }
-            en2m_model_append_caps(caps, "occupancy");
-            en2m_model_append_caps(caps, "motion");
-        }
-
-        if (ep->clusters.illuminance.get_lux != NULL) {
-            uint32_t lux = 0;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("illuminance"));
-            if (ep->clusters.illuminance.get_lux(&lux, ep->clusters.illuminance.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "illuminance", (double)lux);
-            }
-            en2m_model_append_caps(caps, "illuminance");
-        }
-
-        if (ep->clusters.temperature.get_measured_value != NULL) {
-            int16_t centi = 0;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("temp"));
-            if (ep->clusters.temperature.get_measured_value(&centi, ep->clusters.temperature.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "temperature", centi / 100.0);
-            }
-            en2m_model_append_caps(caps, "temperature");
-        }
-
-        if (ep->clusters.humidity.get_measured_value != NULL) {
-            uint16_t centi = 0;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("humidity"));
-            if (ep->clusters.humidity.get_measured_value(&centi, ep->clusters.humidity.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "humidity", centi / 100.0);
-            }
-            en2m_model_append_caps(caps, "humidity");
-        }
-
-        if (ep->clusters.pressure.get_hpa != NULL) {
-            int32_t hpa_x10 = 0;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("pressure"));
-            if (ep->clusters.pressure.get_hpa(&hpa_x10, ep->clusters.pressure.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "pressure", hpa_x10 / 10.0);
-            }
-            en2m_model_append_caps(caps, "pressure");
-        }
-
-        if (ep->clusters.electrical.get_active_power != NULL || ep->clusters.electrical.get_energy != NULL) {
-            cJSON_AddItemToArray(clist, cJSON_CreateString("electrical"));
-            if (ep->clusters.electrical.get_active_power != NULL) {
-                int32_t mw = 0;
-                if (ep->clusters.electrical.get_active_power(&mw, ep->clusters.electrical.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "power", mw / 1000.0);
-                    en2m_model_append_caps(caps, "power");
+            cluster_id = ep->clusters[c].id;
+            for (int s = 0; s < seen_count; s++) {
+                if (seen[s] && seen_ids[s] == cluster_id) {
+                    duplicate = true;
+                    break;
                 }
             }
-            if (ep->clusters.electrical.get_energy != NULL) {
-                int64_t mwh = 0;
-                if (ep->clusters.electrical.get_energy(&mwh, ep->clusters.electrical.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "energy", mwh / 1000.0);
-                    en2m_model_append_caps(caps, "energy");
-                }
+            if (duplicate) {
+                continue;
             }
-        }
-
-        if (ep->clusters.fan.get_mode != NULL) {
-            en2m_fan_mode_t mode = EN2M_FAN_OFF;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("fan"));
-            if (ep->clusters.fan.get_mode(&mode, ep->clusters.fan.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "fan_mode", en2m_fan_mode_str(mode));
-            }
-            if (ep->clusters.fan.get_percent != NULL) {
-                uint8_t pct = 0;
-                if (ep->clusters.fan.get_percent(&pct, ep->clusters.fan.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "percentage", pct);
-                }
-            }
-            en2m_model_append_caps(caps, "fan");
-        }
-
-        if (ep->clusters.cover.get_position != NULL) {
-            uint8_t pos = 0;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("cover"));
-            if (ep->clusters.cover.get_position(&pos, ep->clusters.cover.ctx) == ESP_OK) {
-                cJSON_AddNumberToObject(root, "position", pos);
-                /* HA cover: 0 open, 100 closed → current_cover inverted for friendliness */
-                cJSON_AddStringToObject(root, "cover", pos >= 95 ? "CLOSED" : (pos <= 5 ? "OPEN" : "OPEN"));
-            }
-            en2m_model_append_caps(caps, "cover");
-        }
-
-        if (ep->clusters.lock.get_locked != NULL) {
-            bool locked = false;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("lock"));
-            if (ep->clusters.lock.get_locked(&locked, ep->clusters.lock.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "lock", locked ? "LOCKED" : "UNLOCKED");
-            }
-            en2m_model_append_caps(caps, "lock");
-        }
-
-        if (ep->clusters.thermostat.get_system_mode != NULL) {
-            en2m_thermostat_mode_t mode = EN2M_THERMOSTAT_OFF;
-            cJSON_AddItemToArray(clist, cJSON_CreateString("thermostat"));
-            if (ep->clusters.thermostat.get_system_mode(&mode, ep->clusters.thermostat.ctx) == ESP_OK) {
-                cJSON_AddStringToObject(root, "hvac_mode", en2m_hvac_mode_str(mode));
-            }
-            if (ep->clusters.thermostat.get_local_temperature != NULL) {
-                int16_t t = 0;
-                if (ep->clusters.thermostat.get_local_temperature(&t, ep->clusters.thermostat.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "current_temperature", t / 100.0);
-                }
-            }
-            if (ep->clusters.thermostat.get_occupied_heating != NULL) {
-                int16_t t = 0;
-                if (ep->clusters.thermostat.get_occupied_heating(&t, ep->clusters.thermostat.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "target_temperature", t / 100.0);
-                    cJSON_AddNumberToObject(root, "target_temp_high", t / 100.0);
-                }
-            }
-            if (ep->clusters.thermostat.get_occupied_cooling != NULL) {
-                int16_t t = 0;
-                if (ep->clusters.thermostat.get_occupied_cooling(&t, ep->clusters.thermostat.ctx) == ESP_OK) {
-                    cJSON_AddNumberToObject(root, "target_temp_low", t / 100.0);
-                    if (cJSON_GetObjectItem(root, "target_temperature") == NULL) {
-                        cJSON_AddNumberToObject(root, "target_temperature", t / 100.0);
-                    }
-                }
-            }
-            en2m_model_append_caps(caps, "climate");
-        }
-
-        if (ep->clusters.smoke_co.get_smoke != NULL || ep->clusters.smoke_co.get_co != NULL) {
-            cJSON_AddItemToArray(clist, cJSON_CreateString("smoke_co"));
-            if (ep->clusters.smoke_co.get_smoke != NULL) {
-                bool alarm = false;
-                if (ep->clusters.smoke_co.get_smoke(&alarm, ep->clusters.smoke_co.ctx) == ESP_OK) {
-                    cJSON_AddStringToObject(root, "smoke", alarm ? "ON" : "OFF");
-                    en2m_model_append_caps(caps, "smoke");
-                }
-            }
-            if (ep->clusters.smoke_co.get_co != NULL) {
-                bool alarm = false;
-                if (ep->clusters.smoke_co.get_co(&alarm, ep->clusters.smoke_co.ctx) == ESP_OK) {
-                    cJSON_AddStringToObject(root, "carbon_monoxide", alarm ? "ON" : "OFF");
-                    en2m_model_append_caps(caps, "carbon_monoxide");
-                }
-            }
+            seen[seen_count] = true;
+            seen_ids[seen_count] = cluster_id;
+            seen_count++;
+            en2m_report_cluster(root, caps, ep->id, cluster_id);
         }
     }
 
-    /* Product-style caps for HA platforms */
-    if (has_level || has_color) {
-        en2m_model_append_caps(caps, "light");
-    } else if (has_on_off) {
-        en2m_model_append_caps(caps, "switch");
+    /* A dimmable or tunable node is a light in Home Assistant, not a switch. */
+    if (cJSON_GetObjectItem(root, "brightness") != NULL || cJSON_GetObjectItem(root, "color_temp") != NULL) {
+        cJSON *item = NULL;
+        int index = 0;
+        cJSON_ArrayForEach(item, caps)
+        {
+            if (cJSON_IsString(item) && strcmp(item->valuestring, "switch") == 0) {
+                cJSON_DeleteItemFromArray(caps, index);
+                break;
+            }
+            index++;
+        }
     }
 
-    return root;
-}
-
-esp_err_t en2m_model_report(void)
-{
-    cJSON *root;
-    char *printed;
-    esp_err_t err;
-    size_t len;
-
-    ESP_RETURN_ON_FALSE(s_model.started, ESP_ERR_INVALID_STATE, TAG, "model not started");
-
-    root = en2m_model_build_report_json();
-    ESP_RETURN_ON_FALSE(root != NULL, ESP_ERR_NO_MEM, TAG, "json alloc failed");
+    if (with_caps && cJSON_GetArraySize(caps) > 0) {
+        cJSON_AddItemToObject(root, "caps", caps);
+    } else {
+        cJSON_Delete(caps);
+    }
 
     printed = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    ESP_RETURN_ON_FALSE(printed != NULL, ESP_ERR_NO_MEM, TAG, "json print failed");
+    return printed;
+}
 
-    len = strnlen(printed, EN2M_DATA_MAX + 1);
-    if (len > EN2M_DATA_MAX) {
-        ESP_LOGW(TAG, "report truncated %u > %u", (unsigned)len, EN2M_DATA_MAX);
-        len = EN2M_DATA_MAX;
+static esp_err_t en2m_report_transmit(void)
+{
+    static const struct {
+        bool caps;
+        bool diagnostics;
+    } levels[] = {{true, true}, {true, false}, {false, false}};
+    en2m_event_report_t event = {0};
+    char *json = NULL;
+    size_t len = 0;
+    esp_err_t err;
+
+    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+        json = en2m_report_build(levels[i].caps, levels[i].diagnostics);
+        if (json == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        len = strlen(json);
+        if (len <= EN2M_DATA_MAX) {
+            break;
+        }
+        cJSON_free(json);
+        json = NULL;
     }
 
-    err = en2m_send_uplink(EN2M_MSG_STATE, 0, (const uint8_t *)printed, (uint8_t)len);
-    cJSON_free(printed);
-    s_model.last_report_us = en2m_model_now_us();
+    if (json == NULL) {
+        /* Even the bare value set does not fit; send what we can and say so. */
+        json = en2m_report_build(false, false);
+        if (json == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        len = EN2M_DATA_MAX;
+        event.truncated = true;
+        ESP_LOGE(TAG, "report exceeds %d bytes; split the device across endpoints or trim clusters",
+                 EN2M_DATA_MAX);
+    }
+
+    err = en2m_send_uplink(EN2M_MSG_STATE, 0, (const uint8_t *)json, (uint8_t)len);
+    cJSON_free(json);
+
+    s_model.last_report_ms = en2m_now_ms();
+    s_model.next_report_ms = 0;
+
+    event.length = (uint16_t)len;
+    event.err = err;
+    en2m_event_post(EN2M_EVENT_REPORT_SENT, &event, sizeof(event));
     return err;
 }
 
-static en2m_endpoint_t *en2m_model_first_with_on_off(void)
+esp_err_t en2m_report_now(void)
 {
-    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
-        if (s_model.endpoints[i].used && s_model.endpoints[i].clusters.on_off.set != NULL) {
-            return &s_model.endpoints[i];
-        }
+    ESP_RETURN_ON_FALSE(s_model.started, ESP_ERR_INVALID_STATE, TAG, "en2m not started");
+
+    /* Keep read callbacks and serialization on the en2m task. */
+    if (!en2m_task_is_current()) {
+        return en2m_report_schedule(0);
     }
-    return NULL;
+    en2m_dm_refresh();
+    return en2m_report_transmit();
 }
 
-static bool en2m_model_apply_flat_command(cJSON *doc)
+esp_err_t en2m_report_schedule(uint32_t delay_ms)
 {
-    bool acted = false;
-    const cJSON *sw = cJSON_GetObjectItem(doc, "switch");
-    const cJSON *bri = cJSON_GetObjectItem(doc, "brightness");
-    const cJSON *level = cJSON_GetObjectItem(doc, "level");
-    const cJSON *ct = cJSON_GetObjectItem(doc, "color_temp");
-    const cJSON *cover = cJSON_GetObjectItem(doc, "cover");
-    const cJSON *pos = cJSON_GetObjectItem(doc, "position");
-    const cJSON *lock = cJSON_GetObjectItem(doc, "lock");
-    const cJSON *fan_mode = cJSON_GetObjectItem(doc, "fan_mode");
-    const cJSON *pct = cJSON_GetObjectItem(doc, "percentage");
-    const cJSON *hvac = cJSON_GetObjectItem(doc, "hvac_mode");
-    const cJSON *target = cJSON_GetObjectItem(doc, "target_temperature");
+    int64_t now = en2m_now_ms();
+    int64_t floor_ms;
+    int64_t when;
 
-    if (cJSON_IsString(sw)) {
-        en2m_endpoint_t *ep = en2m_model_first_with_on_off();
-        if (ep != NULL) {
-            bool on = (strcmp(sw->valuestring, "ON") == 0);
-            if (strcmp(sw->valuestring, "TOGGLE") == 0) {
-                bool cur = false;
-                if (ep->clusters.on_off.get) {
-                    ep->clusters.on_off.get(&cur, ep->clusters.on_off.ctx);
-                }
-                on = !cur;
-            }
-            ep->clusters.on_off.set(on, ep->clusters.on_off.ctx);
-            acted = true;
-        }
+    if (!s_model.started) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
-        en2m_endpoint_t *ep = &s_model.endpoints[i];
-        if (!ep->used) {
-            continue;
-        }
-
-        if ((cJSON_IsNumber(bri) || cJSON_IsNumber(level)) && ep->clusters.level.set_level != NULL) {
-            int v = cJSON_IsNumber(bri) ? bri->valueint : level->valueint;
-            if (v < 0) {
-                v = 0;
-            }
-            if (v > 254) {
-                v = 254;
-            }
-            ep->clusters.level.set_level((uint8_t)v, ep->clusters.level.ctx);
-            if (ep->clusters.on_off.set != NULL && v > 0) {
-                ep->clusters.on_off.set(true, ep->clusters.on_off.ctx);
-            }
-            acted = true;
-        }
-
-        if (cJSON_IsNumber(ct) && ep->clusters.color.set_color_temp != NULL) {
-            ep->clusters.color.set_color_temp((uint16_t)ct->valueint, ep->clusters.color.ctx);
-            acted = true;
-        }
-
-        if (ep->clusters.cover.command != NULL && (cJSON_IsString(cover) || cJSON_IsNumber(pos))) {
-            if (cJSON_IsNumber(pos)) {
-                ep->clusters.cover.command(EN2M_COVER_GOTO, (uint8_t)pos->valueint, ep->clusters.cover.ctx);
-            } else if (strcmp(cover->valuestring, "OPEN") == 0) {
-                ep->clusters.cover.command(EN2M_COVER_OPEN, 0, ep->clusters.cover.ctx);
-            } else if (strcmp(cover->valuestring, "CLOSE") == 0) {
-                ep->clusters.cover.command(EN2M_COVER_CLOSE, 100, ep->clusters.cover.ctx);
-            } else if (strcmp(cover->valuestring, "STOP") == 0) {
-                ep->clusters.cover.command(EN2M_COVER_STOP, 0, ep->clusters.cover.ctx);
-            }
-            acted = true;
-        }
-
-        if (cJSON_IsString(lock) && ep->clusters.lock.lock != NULL) {
-            if (strcmp(lock->valuestring, "LOCK") == 0 || strcmp(lock->valuestring, "LOCKED") == 0) {
-                ep->clusters.lock.lock(ep->clusters.lock.ctx);
-            } else {
-                ep->clusters.lock.unlock(ep->clusters.lock.ctx);
-            }
-            acted = true;
-        }
-
-        if (cJSON_IsString(fan_mode) && ep->clusters.fan.set_mode != NULL) {
-            ep->clusters.fan.set_mode(en2m_fan_mode_parse(fan_mode->valuestring), ep->clusters.fan.ctx);
-            acted = true;
-        }
-        if (cJSON_IsNumber(pct) && ep->clusters.fan.set_percent != NULL) {
-            uint8_t p = (uint8_t)pct->valueint;
-            if (p > 100) {
-                p = 100;
-            }
-            ep->clusters.fan.set_percent(p, ep->clusters.fan.ctx);
-            acted = true;
-        }
-
-        if (cJSON_IsString(hvac) && ep->clusters.thermostat.set_system_mode != NULL) {
-            ep->clusters.thermostat.set_system_mode(en2m_hvac_mode_parse(hvac->valuestring),
-                                                    ep->clusters.thermostat.ctx);
-            acted = true;
-        }
-        if (cJSON_IsNumber(target) && ep->clusters.thermostat.set_occupied_heating != NULL) {
-            int16_t centi = (int16_t)(target->valuedouble * 100.0);
-            ep->clusters.thermostat.set_occupied_heating(centi, ep->clusters.thermostat.ctx);
-            if (ep->clusters.thermostat.set_occupied_cooling != NULL) {
-                ep->clusters.thermostat.set_occupied_cooling(centi, ep->clusters.thermostat.ctx);
-            }
-            acted = true;
-        }
+    floor_ms = s_model.last_report_ms + s_model.cfg.min_report_interval_ms;
+    when = now + (int64_t)delay_ms;
+    if (when < floor_ms) {
+        when = floor_ms;
     }
-
-    return acted;
+    if (s_model.next_report_ms == 0 || when < s_model.next_report_ms) {
+        s_model.next_report_ms = when;
+    }
+    return ESP_OK;
 }
 
-static esp_err_t en2m_model_handle_command(const en2m_pkt_t *pkt, void *user_ctx)
+/* ---- change notification ---- */
+
+void en2m_model_on_change(const en2m_attr_path_t *path, const en2m_value_t *value)
 {
-    char tmp[EN2M_DATA_MAX + 1] = {0};
-    cJSON *doc;
-    const cJSON *ep_j;
-    const cJSON *cluster_j;
-    const cJSON *cmd_j;
-    en2m_endpoint_t *ep;
-    uint8_t ep_id = 1;
+    en2m_event_attribute_t event = {.path = *path, .value = *value};
 
-    (void)user_ctx;
-    if (pkt->data_len > 0) {
-        memcpy(tmp, pkt->data, pkt->data_len);
+    en2m_event_post(EN2M_EVENT_ATTRIBUTE_UPDATED, &event, sizeof(event));
+
+    if (s_model.configured && s_model.cfg.attribute_changed != NULL) {
+        s_model.cfg.attribute_changed(path, value, s_model.cfg.user_ctx);
     }
-
-    doc = cJSON_Parse(tmp);
-    if (doc == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (s_model.started && (s_model.cfg.report_mode == EN2M_REPORT_DEFAULT ||
+                            s_model.cfg.report_mode == EN2M_REPORT_ON_CHANGE_ONLY)) {
+        en2m_report_schedule(0);
     }
+}
 
-    /* Flat HA / MQTT style commands first */
-    if (en2m_model_apply_flat_command(doc)) {
-        cJSON_Delete(doc);
-        en2m_model_report();
-        return ESP_OK;
+void en2m_model_on_link_change(bool has_parent)
+{
+    if (has_parent && s_model.started) {
+        s_model.next_report_ms = en2m_now_ms() + 200;
     }
+}
 
-    ep_j = cJSON_GetObjectItem(doc, "ep");
-    if (cJSON_IsNumber(ep_j)) {
-        ep_id = (uint8_t)ep_j->valueint;
-    }
+/* ---- command handling ---- */
 
-    ep = en2m_endpoint_find(ep_id);
-    if (ep == NULL) {
-        cJSON_Delete(doc);
+/**
+ * Run one decoded command: application handlers first, then the built-in
+ * translation into attribute writes.
+ */
+static esp_err_t en2m_model_exec(uint8_t endpoint_id, uint16_t cluster_id, en2m_command_id_t id,
+                                 const char *name, en2m_value_t arg, uint16_t transaction_id,
+                                 const char *json)
+{
+    en2m_command_t cmd = {
+        .endpoint_id = endpoint_id,
+        .cluster_id = cluster_id,
+        .id = id,
+        .name = (name != NULL) ? name : "",
+        .arg = arg,
+        .transaction_id = transaction_id,
+        .json = json,
+    };
+    en2m_event_command_t event = {
+        .endpoint_id = endpoint_id,
+        .cluster_id = cluster_id,
+        .id = id,
+        .transaction_id = transaction_id,
+    };
+    en2m_command_handler_t cluster_cb = NULL;
+    void *cluster_ctx = NULL;
+    struct en2m_cluster *cluster;
+    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
+
+    if (endpoint_id == 0) {
+        ESP_LOGW(TAG, "command %s: no endpoint exposes cluster 0x%04x", cmd.name, cluster_id);
         return ESP_ERR_NOT_FOUND;
     }
 
-    cluster_j = cJSON_GetObjectItem(doc, "cluster");
-    cmd_j = cJSON_GetObjectItem(doc, "command");
-    if (!cJSON_IsString(cluster_j) || !cJSON_IsString(cmd_j)) {
-        cJSON_Delete(doc);
-        return ESP_ERR_INVALID_ARG;
+    en2m_event_post(EN2M_EVENT_COMMAND_RECEIVED, &event, sizeof(event));
+
+    en2m_dm_lock();
+    cluster = en2m_dm_find_cluster(endpoint_id, cluster_id);
+    if (cluster != NULL) {
+        cluster_cb = cluster->command_cb;
+        cluster_ctx = cluster->command_ctx;
+    }
+    en2m_dm_unlock();
+
+    if (cluster_cb != NULL) {
+        err = cluster_cb(&cmd, cluster_ctx);
+    }
+    if (err == ESP_ERR_NOT_SUPPORTED && s_model.cfg.command != NULL) {
+        err = s_model.cfg.command(&cmd, s_model.cfg.user_ctx);
+    }
+    if (err != ESP_ERR_NOT_SUPPORTED) {
+        return err;
     }
 
-    if (strcmp(cluster_j->valuestring, "on_off") == 0 && ep->clusters.on_off.set != NULL) {
+    switch (id) {
+    case EN2M_CMD_ON:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_ON_OFF, en2m_bool(true));
+    case EN2M_CMD_OFF:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_ON_OFF, en2m_bool(false));
+    case EN2M_CMD_TOGGLE: {
+        en2m_value_t current;
         bool on = false;
-        bool cur = false;
-        if (strcmp(cmd_j->valuestring, "on") == 0) {
-            on = true;
-        } else if (strcmp(cmd_j->valuestring, "off") == 0) {
-            on = false;
-        } else if (strcmp(cmd_j->valuestring, "toggle") == 0) {
-            if (ep->clusters.on_off.get) {
-                ep->clusters.on_off.get(&cur, ep->clusters.on_off.ctx);
+        if (en2m_attribute_get(endpoint_id, cluster_id, EN2M_ATTR_ON_OFF, &current) == ESP_OK) {
+            on = current.v.b;
+        }
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_ON_OFF, en2m_bool(!on));
+    }
+    case EN2M_CMD_MOVE_TO_LEVEL: {
+        int64_t level = en2m_value_as_int(&arg);
+        uint8_t on_off_ep;
+        if (level < 0) {
+            level = 0;
+        }
+        if (level > 254) {
+            level = 254;
+        }
+        err = en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_CURRENT_LEVEL, en2m_u8((uint8_t)level));
+        on_off_ep = en2m_model_endpoint_with(EN2M_CLUSTER_ON_OFF);
+        if (err == ESP_OK && level > 0 && on_off_ep != 0) {
+            en2m_attribute_write(on_off_ep, EN2M_CLUSTER_ON_OFF, EN2M_ATTR_ON_OFF, en2m_bool(true));
+        }
+        return err;
+    }
+    case EN2M_CMD_MOVE_TO_COLOR_TEMPERATURE:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_COLOR_TEMPERATURE_MIREDS,
+                                    en2m_u16((uint16_t)en2m_value_as_int(&arg)));
+    case EN2M_CMD_LOCK_DOOR:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_LOCK_STATE,
+                                    en2m_enum8(EN2M_LOCK_LOCKED));
+    case EN2M_CMD_UNLOCK_DOOR:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_LOCK_STATE,
+                                    en2m_enum8(EN2M_LOCK_UNLOCKED));
+    case EN2M_CMD_UP_OR_OPEN:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_CURRENT_POSITION_LIFT_PERCENT,
+                                    en2m_u8(0));
+    case EN2M_CMD_DOWN_OR_CLOSE:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_CURRENT_POSITION_LIFT_PERCENT,
+                                    en2m_u8(100));
+    case EN2M_CMD_GO_TO_LIFT_PERCENTAGE: {
+        int64_t pos = en2m_value_as_int(&arg);
+        if (pos < 0) {
+            pos = 0;
+        }
+        if (pos > 100) {
+            pos = 100;
+        }
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_CURRENT_POSITION_LIFT_PERCENT,
+                                    en2m_u8((uint8_t)pos));
+    }
+    case EN2M_CMD_STOP_MOTION:
+        /* Only the application knows where the motor actually halted. */
+        ESP_LOGW(TAG, "stop needs a command handler or a window covering driver");
+        return ESP_ERR_NOT_SUPPORTED;
+    case EN2M_CMD_SET_FAN_MODE: {
+        uint8_t mode = (uint8_t)en2m_value_as_int(&arg);
+        err = en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_FAN_MODE, en2m_enum8(mode));
+        if (err == ESP_OK && mode == EN2M_FAN_OFF) {
+            en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_PERCENT_SETTING, en2m_u8(0));
+        }
+        return err;
+    }
+    case EN2M_CMD_SET_FAN_PERCENT: {
+        int64_t pct = en2m_value_as_int(&arg);
+        int64_t mode = 0;
+        if (pct < 0) {
+            pct = 0;
+        }
+        if (pct > 100) {
+            pct = 100;
+        }
+        err = en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_PERCENT_SETTING, en2m_u8((uint8_t)pct));
+        if (err != ESP_OK) {
+            return err;
+        }
+        en2m_model_read(endpoint_id, cluster_id, EN2M_ATTR_FAN_MODE, &mode);
+        if (pct == 0 && mode != EN2M_FAN_OFF) {
+            en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_FAN_MODE, en2m_enum8(EN2M_FAN_OFF));
+        } else if (pct > 0 && mode == EN2M_FAN_OFF) {
+            en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_FAN_MODE, en2m_enum8(EN2M_FAN_ON));
+        }
+        return ESP_OK;
+    }
+    case EN2M_CMD_SET_SYSTEM_MODE:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_SYSTEM_MODE,
+                                    en2m_enum8((uint8_t)en2m_value_as_int(&arg)));
+    case EN2M_CMD_SET_HEATING_SETPOINT:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_OCCUPIED_HEATING_SETPOINT,
+                                    en2m_i16((int16_t)en2m_value_as_int(&arg)));
+    case EN2M_CMD_SET_COOLING_SETPOINT:
+        return en2m_attribute_write(endpoint_id, cluster_id, EN2M_ATTR_OCCUPIED_COOLING_SETPOINT,
+                                    en2m_i16((int16_t)en2m_value_as_int(&arg)));
+    case EN2M_CMD_IDENTIFY: {
+        en2m_event_identify_t identify = {
+            .endpoint_id = endpoint_id,
+            .seconds = (uint16_t)en2m_value_as_int(&arg),
+        };
+        en2m_attribute_set(endpoint_id, EN2M_CLUSTER_IDENTIFY, EN2M_ATTR_IDENTIFY_TIME,
+                           en2m_u16(identify.seconds));
+        en2m_event_post(EN2M_EVENT_IDENTIFY, &identify, sizeof(identify));
+        if (s_model.cfg.identify != NULL) {
+            s_model.cfg.identify(endpoint_id, identify.seconds, s_model.cfg.user_ctx);
+        }
+        return ESP_OK;
+    }
+    default:
+        ESP_LOGW(TAG, "unhandled command '%s' on cluster 0x%04x", cmd.name, cluster_id);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+/** Dispatch on a cluster the request names by id, falling back to discovery. */
+static esp_err_t en2m_model_exec_on_cluster(uint8_t endpoint_id, uint16_t cluster_id,
+                                            en2m_command_id_t id, const char *name, en2m_value_t arg,
+                                            uint16_t transaction_id, const char *json)
+{
+    if (endpoint_id == 0) {
+        endpoint_id = en2m_model_endpoint_with(cluster_id);
+    }
+    return en2m_model_exec(endpoint_id, cluster_id, id, name, arg, transaction_id, json);
+}
+
+/**
+ * Home Assistant / MQTT style payloads, e.g. {"switch":"ON"} or
+ * {"brightness":128}. Returns the number of commands that were recognized.
+ */
+static int en2m_model_decode_flat(const cJSON *doc, uint8_t endpoint_id, uint16_t transaction_id,
+                                  const char *json)
+{
+    const cJSON *item;
+    int handled = 0;
+
+    item = cJSON_GetObjectItem(doc, "switch");
+    if (cJSON_IsString(item)) {
+        en2m_command_id_t id = EN2M_CMD_OFF;
+        if (strcmp(item->valuestring, "TOGGLE") == 0) {
+            id = EN2M_CMD_TOGGLE;
+        } else if (strcmp(item->valuestring, "ON") == 0) {
+            id = EN2M_CMD_ON;
+        }
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_ON_OFF, id, item->valuestring,
+                                   (en2m_value_t){0}, transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "brightness");
+    if (!cJSON_IsNumber(item)) {
+        item = cJSON_GetObjectItem(doc, "level");
+    }
+    if (cJSON_IsNumber(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_LEVEL_CONTROL, EN2M_CMD_MOVE_TO_LEVEL,
+                                   "brightness", en2m_u16((uint16_t)item->valueint), transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "color_temp");
+    if (cJSON_IsNumber(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_COLOR_CONTROL,
+                                   EN2M_CMD_MOVE_TO_COLOR_TEMPERATURE, "color_temp",
+                                   en2m_u16((uint16_t)item->valueint), transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "position");
+    if (cJSON_IsNumber(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_WINDOW_COVERING,
+                                   EN2M_CMD_GO_TO_LIFT_PERCENTAGE, "position",
+                                   en2m_u8((uint8_t)item->valueint), transaction_id, json);
+        handled++;
+    } else {
+        item = cJSON_GetObjectItem(doc, "cover");
+        if (cJSON_IsString(item)) {
+            en2m_command_id_t id = EN2M_CMD_STOP_MOTION;
+            if (strcmp(item->valuestring, "OPEN") == 0) {
+                id = EN2M_CMD_UP_OR_OPEN;
+            } else if (strcmp(item->valuestring, "CLOSE") == 0 || strcmp(item->valuestring, "CLOSED") == 0) {
+                id = EN2M_CMD_DOWN_OR_CLOSE;
             }
-            on = !cur;
+            en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_WINDOW_COVERING, id, item->valuestring,
+                                       (en2m_value_t){0}, transaction_id, json);
+            handled++;
         }
-        ep->clusters.on_off.set(on, ep->clusters.on_off.ctx);
-    } else if (strcmp(cluster_j->valuestring, "level_control") == 0 && ep->clusters.level.set_level != NULL) {
-        const cJSON *level_j = cJSON_GetObjectItem(doc, "level");
-        if (cJSON_IsNumber(level_j)) {
-            ep->clusters.level.set_level((uint8_t)level_j->valueint, ep->clusters.level.ctx);
+    }
+
+    item = cJSON_GetObjectItem(doc, "lock");
+    if (cJSON_IsString(item)) {
+        bool lock = (strcmp(item->valuestring, "LOCK") == 0 || strcmp(item->valuestring, "LOCKED") == 0);
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_DOOR_LOCK,
+                                   lock ? EN2M_CMD_LOCK_DOOR : EN2M_CMD_UNLOCK_DOOR, item->valuestring,
+                                   (en2m_value_t){0}, transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "fan_mode");
+    if (cJSON_IsString(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_FAN_CONTROL, EN2M_CMD_SET_FAN_MODE,
+                                   item->valuestring, en2m_enum8(en2m_fan_mode_parse(item->valuestring)),
+                                   transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "percentage");
+    if (cJSON_IsNumber(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_FAN_CONTROL, EN2M_CMD_SET_FAN_PERCENT,
+                                   "percentage", en2m_u8((uint8_t)item->valueint), transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "hvac_mode");
+    if (cJSON_IsString(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_THERMOSTAT, EN2M_CMD_SET_SYSTEM_MODE,
+                                   item->valuestring, en2m_enum8(en2m_hvac_mode_parse(item->valuestring)),
+                                   transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "target_temperature");
+    if (cJSON_IsNumber(item)) {
+        int64_t mode = EN2M_THERMOSTAT_HEAT;
+        uint8_t ep = (endpoint_id != 0) ? endpoint_id : en2m_model_endpoint_with(EN2M_CLUSTER_THERMOSTAT);
+        en2m_value_t centi = en2m_i16((int16_t)(item->valuedouble * 100.0));
+
+        en2m_model_read(ep, EN2M_CLUSTER_THERMOSTAT, EN2M_ATTR_SYSTEM_MODE, &mode);
+        en2m_model_exec_on_cluster(ep, EN2M_CLUSTER_THERMOSTAT,
+                                   (mode == EN2M_THERMOSTAT_COOL) ? EN2M_CMD_SET_COOLING_SETPOINT
+                                                                  : EN2M_CMD_SET_HEATING_SETPOINT,
+                                   "target_temperature", centi, transaction_id, json);
+        handled++;
+    }
+
+    item = cJSON_GetObjectItem(doc, "identify");
+    if (cJSON_IsNumber(item)) {
+        en2m_model_exec_on_cluster(endpoint_id, EN2M_CLUSTER_IDENTIFY, EN2M_CMD_IDENTIFY, "identify",
+                                   en2m_u16((uint16_t)item->valueint), transaction_id, json);
+        handled++;
+    }
+
+    return handled;
+}
+
+/** Cluster-addressed payloads, e.g. {"ep":1,"cluster":"on_off","command":"toggle"}. */
+static const struct {
+    const char *name;
+    uint16_t id;
+} k_cluster_names[] = {
+    {"identify", EN2M_CLUSTER_IDENTIFY},
+    {"on_off", EN2M_CLUSTER_ON_OFF},
+    {"level_control", EN2M_CLUSTER_LEVEL_CONTROL},
+    {"color_control", EN2M_CLUSTER_COLOR_CONTROL},
+    {"door_lock", EN2M_CLUSTER_DOOR_LOCK},
+    {"window_covering", EN2M_CLUSTER_WINDOW_COVERING},
+    {"thermostat", EN2M_CLUSTER_THERMOSTAT},
+    {"fan_control", EN2M_CLUSTER_FAN_CONTROL},
+};
+
+static bool en2m_cluster_id_from_name(const char *name, uint16_t *out)
+{
+    for (size_t i = 0; i < sizeof(k_cluster_names) / sizeof(k_cluster_names[0]); i++) {
+        if (strcmp(k_cluster_names[i].name, name) == 0) {
+            *out = k_cluster_names[i].id;
+            return true;
         }
-    } else if (strcmp(cluster_j->valuestring, "color_control") == 0 && ep->clusters.color.set_color_temp != NULL) {
-        const cJSON *ct_j = cJSON_GetObjectItem(doc, "color_temp");
-        if (cJSON_IsNumber(ct_j)) {
-            ep->clusters.color.set_color_temp((uint16_t)ct_j->valueint, ep->clusters.color.ctx);
+    }
+    return false;
+}
+
+static en2m_command_id_t en2m_command_id_from_name(uint16_t cluster_id, const char *name)
+{
+    if (cluster_id == EN2M_CLUSTER_ON_OFF) {
+        if (strcmp(name, "on") == 0) {
+            return EN2M_CMD_ON;
         }
-    } else if (strcmp(cluster_j->valuestring, "window_covering") == 0 && ep->clusters.cover.command != NULL) {
-        const cJSON *pos_j = cJSON_GetObjectItem(doc, "position");
-        uint8_t p = cJSON_IsNumber(pos_j) ? (uint8_t)pos_j->valueint : 0;
-        if (strcmp(cmd_j->valuestring, "open") == 0) {
-            ep->clusters.cover.command(EN2M_COVER_OPEN, 0, ep->clusters.cover.ctx);
-        } else if (strcmp(cmd_j->valuestring, "close") == 0) {
-            ep->clusters.cover.command(EN2M_COVER_CLOSE, 100, ep->clusters.cover.ctx);
-        } else if (strcmp(cmd_j->valuestring, "stop") == 0) {
-            ep->clusters.cover.command(EN2M_COVER_STOP, 0, ep->clusters.cover.ctx);
-        } else if (strcmp(cmd_j->valuestring, "go_to") == 0) {
-            ep->clusters.cover.command(EN2M_COVER_GOTO, p, ep->clusters.cover.ctx);
+        if (strcmp(name, "off") == 0) {
+            return EN2M_CMD_OFF;
         }
-    } else if (strcmp(cluster_j->valuestring, "door_lock") == 0) {
-        if (strcmp(cmd_j->valuestring, "lock") == 0 && ep->clusters.lock.lock) {
-            ep->clusters.lock.lock(ep->clusters.lock.ctx);
-        } else if (strcmp(cmd_j->valuestring, "unlock") == 0 && ep->clusters.lock.unlock) {
-            ep->clusters.lock.unlock(ep->clusters.lock.ctx);
+        if (strcmp(name, "toggle") == 0) {
+            return EN2M_CMD_TOGGLE;
         }
-    } else if (strcmp(cluster_j->valuestring, "fan_control") == 0) {
-        if (strcmp(cmd_j->valuestring, "set_mode") == 0 && ep->clusters.fan.set_mode) {
-            const cJSON *m = cJSON_GetObjectItem(doc, "mode");
-            if (cJSON_IsString(m)) {
-                ep->clusters.fan.set_mode(en2m_fan_mode_parse(m->valuestring), ep->clusters.fan.ctx);
-            }
-        } else if (strcmp(cmd_j->valuestring, "set_percent") == 0 && ep->clusters.fan.set_percent) {
-            const cJSON *p = cJSON_GetObjectItem(doc, "percentage");
-            if (cJSON_IsNumber(p)) {
-                ep->clusters.fan.set_percent((uint8_t)p->valueint, ep->clusters.fan.ctx);
-            }
+    } else if (cluster_id == EN2M_CLUSTER_LEVEL_CONTROL) {
+        if (strcmp(name, "move_to_level") == 0) {
+            return EN2M_CMD_MOVE_TO_LEVEL;
         }
-    } else if (strcmp(cluster_j->valuestring, "thermostat") == 0) {
-        if (strcmp(cmd_j->valuestring, "set_mode") == 0 && ep->clusters.thermostat.set_system_mode) {
-            const cJSON *m = cJSON_GetObjectItem(doc, "mode");
-            if (cJSON_IsString(m)) {
-                ep->clusters.thermostat.set_system_mode(en2m_hvac_mode_parse(m->valuestring),
-                                                        ep->clusters.thermostat.ctx);
-            }
-        } else if (strcmp(cmd_j->valuestring, "set_heating") == 0 &&
-                   ep->clusters.thermostat.set_occupied_heating) {
-            const cJSON *t = cJSON_GetObjectItem(doc, "temperature");
-            if (cJSON_IsNumber(t)) {
-                ep->clusters.thermostat.set_occupied_heating((int16_t)(t->valuedouble * 100.0),
-                                                             ep->clusters.thermostat.ctx);
-            }
-        } else if (strcmp(cmd_j->valuestring, "set_cooling") == 0 &&
-                   ep->clusters.thermostat.set_occupied_cooling) {
-            const cJSON *t = cJSON_GetObjectItem(doc, "temperature");
-            if (cJSON_IsNumber(t)) {
-                ep->clusters.thermostat.set_occupied_cooling((int16_t)(t->valuedouble * 100.0),
-                                                             ep->clusters.thermostat.ctx);
-            }
+    } else if (cluster_id == EN2M_CLUSTER_COLOR_CONTROL) {
+        if (strcmp(name, "move_to_color_temperature") == 0) {
+            return EN2M_CMD_MOVE_TO_COLOR_TEMPERATURE;
         }
+    } else if (cluster_id == EN2M_CLUSTER_DOOR_LOCK) {
+        if (strcmp(name, "lock") == 0) {
+            return EN2M_CMD_LOCK_DOOR;
+        }
+        if (strcmp(name, "unlock") == 0) {
+            return EN2M_CMD_UNLOCK_DOOR;
+        }
+    } else if (cluster_id == EN2M_CLUSTER_WINDOW_COVERING) {
+        if (strcmp(name, "open") == 0) {
+            return EN2M_CMD_UP_OR_OPEN;
+        }
+        if (strcmp(name, "close") == 0) {
+            return EN2M_CMD_DOWN_OR_CLOSE;
+        }
+        if (strcmp(name, "stop") == 0) {
+            return EN2M_CMD_STOP_MOTION;
+        }
+        if (strcmp(name, "go_to") == 0) {
+            return EN2M_CMD_GO_TO_LIFT_PERCENTAGE;
+        }
+    } else if (cluster_id == EN2M_CLUSTER_FAN_CONTROL) {
+        if (strcmp(name, "set_mode") == 0) {
+            return EN2M_CMD_SET_FAN_MODE;
+        }
+        if (strcmp(name, "set_percent") == 0) {
+            return EN2M_CMD_SET_FAN_PERCENT;
+        }
+    } else if (cluster_id == EN2M_CLUSTER_THERMOSTAT) {
+        if (strcmp(name, "set_mode") == 0) {
+            return EN2M_CMD_SET_SYSTEM_MODE;
+        }
+        if (strcmp(name, "set_heating") == 0) {
+            return EN2M_CMD_SET_HEATING_SETPOINT;
+        }
+        if (strcmp(name, "set_cooling") == 0) {
+            return EN2M_CMD_SET_COOLING_SETPOINT;
+        }
+    } else if (cluster_id == EN2M_CLUSTER_IDENTIFY) {
+        if (strcmp(name, "identify") == 0) {
+            return EN2M_CMD_IDENTIFY;
+        }
+    }
+    return EN2M_CMD_UNKNOWN;
+}
+
+static en2m_value_t en2m_command_arg(const cJSON *doc, uint16_t cluster_id, en2m_command_id_t id)
+{
+    const cJSON *item;
+
+    switch (id) {
+    case EN2M_CMD_MOVE_TO_LEVEL:
+        item = cJSON_GetObjectItem(doc, "level");
+        return cJSON_IsNumber(item) ? en2m_u16((uint16_t)item->valueint) : (en2m_value_t){0};
+    case EN2M_CMD_MOVE_TO_COLOR_TEMPERATURE:
+        item = cJSON_GetObjectItem(doc, "color_temp");
+        return cJSON_IsNumber(item) ? en2m_u16((uint16_t)item->valueint) : (en2m_value_t){0};
+    case EN2M_CMD_GO_TO_LIFT_PERCENTAGE:
+        item = cJSON_GetObjectItem(doc, "position");
+        return cJSON_IsNumber(item) ? en2m_u8((uint8_t)item->valueint) : (en2m_value_t){0};
+    case EN2M_CMD_SET_FAN_MODE:
+        item = cJSON_GetObjectItem(doc, "mode");
+        return cJSON_IsString(item) ? en2m_enum8(en2m_fan_mode_parse(item->valuestring))
+                                    : (en2m_value_t){0};
+    case EN2M_CMD_SET_FAN_PERCENT:
+        item = cJSON_GetObjectItem(doc, "percentage");
+        return cJSON_IsNumber(item) ? en2m_u8((uint8_t)item->valueint) : (en2m_value_t){0};
+    case EN2M_CMD_SET_SYSTEM_MODE:
+        item = cJSON_GetObjectItem(doc, "mode");
+        return cJSON_IsString(item) ? en2m_enum8(en2m_hvac_mode_parse(item->valuestring))
+                                    : (en2m_value_t){0};
+    case EN2M_CMD_SET_HEATING_SETPOINT:
+    case EN2M_CMD_SET_COOLING_SETPOINT:
+        item = cJSON_GetObjectItem(doc, "temperature");
+        return cJSON_IsNumber(item) ? en2m_i16((int16_t)(item->valuedouble * 100.0)) : (en2m_value_t){0};
+    case EN2M_CMD_IDENTIFY:
+        item = cJSON_GetObjectItem(doc, "seconds");
+        return cJSON_IsNumber(item) ? en2m_u16((uint16_t)item->valueint) : en2m_u16(10);
+    default:
+        (void)cluster_id;
+        return (en2m_value_t){0};
+    }
+}
+
+void en2m_model_on_command_frame(const en2m_pkt_t *pkt)
+{
+    char payload[EN2M_DATA_MAX + 1] = {0};
+    const cJSON *ep_item;
+    const cJSON *cluster_item;
+    const cJSON *command_item;
+    uint8_t endpoint_id = 0;
+    uint16_t cluster_id = 0;
+    cJSON *doc;
+
+    if (!s_model.started) {
+        return;
+    }
+    if (pkt->data_len > 0) {
+        memcpy(payload, pkt->data, pkt->data_len);
+    }
+
+    doc = cJSON_Parse(payload);
+    if (doc == NULL) {
+        ESP_LOGW(TAG, "command payload is not valid JSON");
+        return;
+    }
+
+    ep_item = cJSON_GetObjectItem(doc, "ep");
+    if (cJSON_IsNumber(ep_item)) {
+        endpoint_id = (uint8_t)ep_item->valueint;
+    }
+
+    cluster_item = cJSON_GetObjectItem(doc, "cluster");
+    command_item = cJSON_GetObjectItem(doc, "command");
+    if (cJSON_IsString(cluster_item) && cJSON_IsString(command_item) &&
+        en2m_cluster_id_from_name(cluster_item->valuestring, &cluster_id)) {
+        en2m_command_id_t id = en2m_command_id_from_name(cluster_id, command_item->valuestring);
+        en2m_model_exec_on_cluster(endpoint_id, cluster_id, id, command_item->valuestring,
+                                   en2m_command_arg(doc, cluster_id, id), pkt->cmd_id, payload);
+    } else if (en2m_model_decode_flat(doc, endpoint_id, pkt->cmd_id, payload) == 0) {
+        ESP_LOGW(TAG, "command payload had nothing this device understands");
     }
 
     cJSON_Delete(doc);
-    en2m_model_report();
+
+    if (pkt->cmd_id != 0) {
+        en2m_send_uplink(EN2M_MSG_ACK, pkt->cmd_id, NULL, 0);
+    }
+    en2m_report_schedule(0);
+}
+
+/* ---- periodic work ---- */
+
+/** Count the Identify cluster down once a second and re-trigger the effect. */
+static void en2m_model_identify_tick(int64_t now_ms)
+{
+    if (now_ms < s_model.next_identify_ms) {
+        return;
+    }
+    s_model.next_identify_ms = now_ms + 1000;
+
+    for (int i = 0; i < EN2M_MAX_ENDPOINTS; i++) {
+        struct en2m_endpoint *ep = en2m_dm_endpoint_slot(i);
+        int64_t remaining = 0;
+
+        if (ep == NULL || !ep->used) {
+            continue;
+        }
+        if (!en2m_model_read(ep->id, EN2M_CLUSTER_IDENTIFY, EN2M_ATTR_IDENTIFY_TIME, &remaining) ||
+            remaining <= 0) {
+            continue;
+        }
+        remaining--;
+        en2m_attribute_set(ep->id, EN2M_CLUSTER_IDENTIFY, EN2M_ATTR_IDENTIFY_TIME,
+                           en2m_u16((uint16_t)remaining));
+        if (s_model.cfg.identify != NULL) {
+            s_model.cfg.identify(ep->id, (uint16_t)remaining, s_model.cfg.user_ctx);
+        }
+    }
+}
+
+void en2m_model_tick(int64_t now_ms)
+{
+    bool periodic_due;
+
+    if (!s_model.started) {
+        return;
+    }
+
+    en2m_model_identify_tick(now_ms);
+
+    if (now_ms - s_model.last_persist_ms >= EN2M_PERSIST_FLUSH_MS) {
+        s_model.last_persist_ms = now_ms;
+        en2m_dm_flush_persist();
+    }
+
+    periodic_due = (s_model.cfg.report_mode == EN2M_REPORT_DEFAULT ||
+                    s_model.cfg.report_mode == EN2M_REPORT_PERIODIC_ONLY) &&
+                   (now_ms - s_model.last_report_ms >= (int64_t)s_model.cfg.report_interval_ms);
+
+    if (periodic_due || (s_model.next_report_ms != 0 && now_ms >= s_model.next_report_ms)) {
+        en2m_dm_refresh();
+        en2m_report_transmit();
+    }
+}
+
+/* ---- lifecycle ---- */
+
+/** Push restored values back into the hardware so it matches the reported state. */
+static void en2m_model_apply_persisted(void)
+{
+    for (int e = 0; e < EN2M_MAX_ENDPOINTS; e++) {
+        struct en2m_endpoint *ep = en2m_dm_endpoint_slot(e);
+        if (ep == NULL || !ep->used) {
+            continue;
+        }
+        for (int c = 0; c < EN2M_MAX_CLUSTERS_PER_ENDPOINT; c++) {
+            for (int a = 0; a < EN2M_MAX_ATTRIBUTES_PER_CLUSTER; a++) {
+                en2m_attr_path_t path;
+                en2m_value_t value;
+
+                en2m_dm_lock();
+                if (!ep->clusters[c].used || !ep->clusters[c].attrs[a].used ||
+                    !ep->clusters[c].attrs[a].persist) {
+                    en2m_dm_unlock();
+                    continue;
+                }
+                path.endpoint_id = ep->id;
+                path.cluster_id = ep->clusters[c].id;
+                path.attribute_id = ep->clusters[c].attrs[a].id;
+                value = ep->clusters[c].attrs[a].value;
+                en2m_dm_unlock();
+
+                en2m_attribute_write(path.endpoint_id, path.cluster_id, path.attribute_id, value);
+            }
+        }
+    }
+}
+
+esp_err_t en2m_start(const en2m_device_config_t *config)
+{
+    en2m_device_config_t cfg;
+
+    ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "config is NULL");
+    ESP_RETURN_ON_FALSE(!s_model.started, ESP_ERR_INVALID_STATE, TAG, "already started");
+
+    cfg = *config;
+    if (cfg.report_interval_ms == 0) {
+        cfg.report_interval_ms = (cfg.mesh.role == EN2M_ROLE_LEAF) ? EN2M_REPORT_INTERVAL_LEAF_MS
+                                                                   : EN2M_REPORT_INTERVAL_MAINS_MS;
+    }
+    if (cfg.min_report_interval_ms == 0) {
+        cfg.min_report_interval_ms = EN2M_MIN_REPORT_INTERVAL_MS;
+    }
+    s_model.cfg = cfg;
+    s_model.configured = true;
+
+    ESP_RETURN_ON_ERROR(en2m_mesh_init(&s_model.cfg.mesh), TAG, "mesh init failed");
+
+    en2m_dm_restore();
+    en2m_model_apply_persisted();
+
+    s_model.last_report_ms = en2m_now_ms();
+    s_model.last_persist_ms = s_model.last_report_ms;
+    s_model.started = true;
+    s_model.next_report_ms = s_model.last_report_ms + 500;
+
+    en2m_event_post(EN2M_EVENT_STARTED, NULL, 0);
     return ESP_OK;
 }
 
-static void en2m_model_on_command(const en2m_pkt_t *pkt, void *user_ctx)
+esp_err_t en2m_stop(void)
 {
-    en2m_model_handle_command(pkt, user_ctx);
+    if (!s_model.started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_model.started = false;
+    en2m_dm_flush_persist();
+    en2m_mesh_deinit();
+    en2m_event_post(EN2M_EVENT_STOPPED, NULL, 0);
+    return ESP_OK;
 }
+
+/* ---- deprecated shims ---- */
 
 esp_err_t en2m_model_start(const en2m_config_t *mesh_config)
 {
-    en2m_config_t cfg;
+    en2m_device_config_t cfg = {0};
 
-    ESP_RETURN_ON_FALSE(mesh_config != NULL, ESP_ERR_INVALID_ARG, TAG, "mesh_config NULL");
-
-    cfg = *mesh_config;
-    if (cfg.on_command == NULL) {
-        cfg.on_command = en2m_model_on_command;
-    }
-
-    ESP_RETURN_ON_ERROR(en2m_mesh_init(&cfg), TAG, "mesh init failed");
-    s_model.started = true;
-    s_model.report_interval_ms = (cfg.role == EN2M_ROLE_LEAF) ? 30000 : 15000;
-    en2m_model_report();
-    return ESP_OK;
+    ESP_RETURN_ON_FALSE(mesh_config != NULL, ESP_ERR_INVALID_ARG, TAG, "mesh_config is NULL");
+    cfg.mesh = *mesh_config;
+    return en2m_start(&cfg);
 }
 
 void en2m_model_loop(void)
 {
-    en2m_mesh_loop();
-    if (!s_model.started) {
-        return;
-    }
-    if ((en2m_model_now_us() - s_model.last_report_us) / 1000 >= s_model.report_interval_ms) {
-        en2m_model_report();
+    static bool warned;
+
+    if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "en2m_model_loop() is obsolete: the component runs its own task");
     }
 }
 
-esp_err_t en2m_model_notify(uint8_t endpoint_id, en2m_cluster_id_t cluster, bool immediate)
+esp_err_t en2m_model_report(void)
+{
+    return en2m_report_now();
+}
+
+esp_err_t en2m_model_notify(uint8_t endpoint_id, uint16_t cluster_id, bool immediate)
 {
     (void)endpoint_id;
-    (void)cluster;
-    if (immediate) {
-        return en2m_model_report();
-    }
-    s_model.last_report_us = 0; /* force soon */
-    return ESP_OK;
+    (void)cluster_id;
+    return immediate ? en2m_report_now() : en2m_report_schedule(0);
 }

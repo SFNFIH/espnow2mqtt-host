@@ -1,6 +1,11 @@
 /**
  * @file en2m_mesh.c
- * @brief ESP-NOW mesh tree implementation.
+ * @brief ESP-NOW mesh tree: one task, one queue, acknowledged downlinks.
+ *
+ * The ESP-NOW receive callback only copies a frame into the queue. Everything
+ * else — parent selection, route learning, forwarding, retries, command
+ * delivery, reporting — happens on the en2m task, which is also where
+ * application callbacks are invoked. Nothing in this layer needs pumping.
  */
 
 #include <stddef.h>
@@ -17,7 +22,6 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
-#include "en2m_mesh.h"
 #include "en2m_priv.h"
 
 static const char *TAG = "en2m";
@@ -33,6 +37,20 @@ static int64_t en2m_now_us(void)
 static int64_t en2m_now_ms(void)
 {
     return en2m_now_us() / 1000;
+}
+
+static void en2m_lock(void)
+{
+    if (s_ctx.lock != NULL) {
+        xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
+    }
+}
+
+static void en2m_unlock(void)
+{
+    if (s_ctx.lock != NULL) {
+        xSemaphoreGive(s_ctx.lock);
+    }
 }
 
 static void en2m_emit_log(const char *msg)
@@ -188,22 +206,27 @@ static void en2m_expire_routes(void)
     }
 }
 
-static void en2m_expire_parent(void)
+/** @return true when the parent was just lost, so the caller can notify. */
+static bool en2m_expire_parent(en2m_event_parent_t *out_lost)
 {
-    if (s_ctx.config.role == EN2M_ROLE_COORDINATOR) {
-        return;
+    if (s_ctx.config.role == EN2M_ROLE_COORDINATOR || !s_ctx.has_parent) {
+        return false;
     }
-    if (!s_ctx.has_parent) {
-        return;
+    if ((en2m_now_ms() - s_ctx.parent_last_us / 1000) <= EN2M_PARENT_STALE_MS) {
+        return false;
     }
-    if ((en2m_now_ms() - s_ctx.parent_last_us / 1000) > EN2M_PARENT_STALE_MS) {
-        s_ctx.has_parent = false;
-        s_ctx.path_cost = 255;
-        en2m_emit_log("parent stale");
-    }
+
+    en2m_mac_copy(out_lost->mac, s_ctx.parent_mac);
+    out_lost->cost = s_ctx.path_cost;
+    out_lost->rssi = 0;
+    s_ctx.has_parent = false;
+    s_ctx.path_cost = 255;
+    en2m_emit_log("parent stale");
+    return true;
 }
 
-static void en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t their_cost, int8_t rssi)
+/** @return true when a new parent was adopted. */
+static bool en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t their_cost, int8_t rssi)
 {
     uint8_t new_cost;
     bool better = false;
@@ -211,18 +234,18 @@ static void en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t the
     char mac_str[18];
 
     if (s_ctx.config.role == EN2M_ROLE_COORDINATOR) {
-        return;
+        return false;
     }
     if (role != EN2M_ROLE_COORDINATOR && role != EN2M_ROLE_ROUTER) {
-        return;
+        return false;
     }
     if (their_cost >= 254) {
-        return;
+        return false;
     }
 
     new_cost = (uint8_t)(their_cost + 1);
     if (new_cost > EN2M_HOP_LIMIT) {
-        return;
+        return false;
     }
 
     if (!s_ctx.has_parent) {
@@ -231,7 +254,7 @@ static void en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t the
         better = true;
     } else if (new_cost == s_ctx.path_cost && en2m_mac_equal(s_ctx.parent_mac, mac)) {
         s_ctx.parent_last_us = en2m_now_us();
-        return;
+        return false;
     } else if (new_cost == s_ctx.path_cost) {
         int8_t cur_rssi = -100;
         for (int i = 0; i < EN2M_MAX_NEIGHBORS; i++) {
@@ -246,7 +269,7 @@ static void en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t the
     }
 
     if (!better) {
-        return;
+        return false;
     }
 
     en2m_mac_copy(s_ctx.parent_mac, mac);
@@ -258,6 +281,7 @@ static void en2m_consider_parent(const uint8_t mac[6], uint8_t role, uint8_t the
     en2m_mac_to_str(s_ctx.parent_mac, mac_str);
     snprintf(log_buf, sizeof(log_buf), "parent=%s cost=%u rssi=%d", mac_str, s_ctx.path_cost, (int)rssi);
     en2m_emit_log(log_buf);
+    return true;
 }
 
 static void en2m_send_beacon(void)
@@ -322,7 +346,105 @@ static void en2m_forward_toward_dest(en2m_pkt_t *pkt)
     en2m_send_raw(next, pkt);
 }
 
-static void en2m_handle_rx(const uint8_t from[6], const en2m_pkt_t *in, int8_t rssi)
+/* ---- acknowledged downlinks ---- */
+
+/** Caller holds the lock. */
+static void en2m_pending_add(const uint8_t dest[6], uint16_t cmd_id, const en2m_pkt_t *pkt)
+{
+    uint32_t interval = s_ctx.config.retry_interval_ms ? s_ctx.config.retry_interval_ms : EN2M_CMD_RETRY_MS;
+    int slot = -1;
+
+    for (int i = 0; i < EN2M_MAX_PENDING; i++) {
+        if (s_ctx.pending[i].used && s_ctx.pending[i].cmd_id == cmd_id &&
+            en2m_mac_equal(s_ctx.pending[i].dest, dest)) {
+            slot = i;
+            break;
+        }
+        if (!s_ctx.pending[i].used && slot < 0) {
+            slot = i;
+        }
+    }
+    if (slot < 0) {
+        ESP_LOGW(TAG, "no free retry slot; command %u is sent unacknowledged", cmd_id);
+        return;
+    }
+
+    s_ctx.pending[slot].used = true;
+    en2m_mac_copy(s_ctx.pending[slot].dest, dest);
+    s_ctx.pending[slot].cmd_id = cmd_id;
+    s_ctx.pending[slot].attempts = 1;
+    s_ctx.pending[slot].next_us = en2m_now_us() + (int64_t)interval * 1000;
+    s_ctx.pending[slot].pkt = *pkt;
+}
+
+/** Caller holds the lock. @return true when a pending entry was cleared. */
+static bool en2m_pending_resolve(const uint8_t origin[6], uint16_t cmd_id, uint8_t *out_attempts)
+{
+    for (int i = 0; i < EN2M_MAX_PENDING; i++) {
+        if (s_ctx.pending[i].used && s_ctx.pending[i].cmd_id == cmd_id &&
+            en2m_mac_equal(s_ctx.pending[i].dest, origin)) {
+            *out_attempts = s_ctx.pending[i].attempts;
+            s_ctx.pending[i].used = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Resend or expire outstanding downlinks. Caller holds the lock. */
+static void en2m_pending_tick(en2m_event_ack_t *timeouts, int *timeout_count, int timeout_max)
+{
+    uint8_t max_retries = s_ctx.config.max_retries ? s_ctx.config.max_retries : EN2M_CMD_RETRIES;
+    uint32_t interval = s_ctx.config.retry_interval_ms ? s_ctx.config.retry_interval_ms : EN2M_CMD_RETRY_MS;
+    int64_t now = en2m_now_us();
+
+    for (int i = 0; i < EN2M_MAX_PENDING; i++) {
+        en2m_pending_t *p = &s_ctx.pending[i];
+        uint8_t next[6];
+
+        if (!p->used || now < p->next_us) {
+            continue;
+        }
+        if (p->attempts > max_retries) {
+            p->used = false;
+            if (*timeout_count < timeout_max) {
+                en2m_mac_copy(timeouts[*timeout_count].mac, p->dest);
+                timeouts[*timeout_count].transaction_id = p->cmd_id;
+                timeouts[*timeout_count].attempts = p->attempts;
+                (*timeout_count)++;
+            }
+            continue;
+        }
+
+        p->attempts++;
+        p->next_us = now + (int64_t)interval * 1000;
+        if (!en2m_lookup_route(p->dest, next)) {
+            en2m_mac_copy(next, p->dest);
+        }
+        en2m_send_raw(next, &p->pkt);
+    }
+}
+
+/* ---- receive path ---- */
+
+/**
+ * Classify and act on one frame. Runs with the lock held, so anything that
+ * calls back into the application is reported through the out-parameters and
+ * performed by the caller after unlocking.
+ */
+typedef struct {
+    bool deliver_command;
+    bool parent_found;
+    bool ack_resolved;
+    en2m_event_parent_t parent;
+    en2m_event_ack_t ack;
+    bool uplink;
+    int8_t uplink_rssi;
+    uint8_t uplink_from[6];
+} en2m_rx_outcome_t;
+
+static void en2m_handle_rx(const uint8_t from[6], const en2m_pkt_t *in, int8_t rssi,
+                           en2m_rx_outcome_t *out)
 {
     if (in->magic != EN2M_MAGIC || in->version != EN2M_VERSION) {
         return;
@@ -334,14 +456,17 @@ static void en2m_handle_rx(const uint8_t from[6], const en2m_pkt_t *in, int8_t r
     en2m_remember_neighbor(from, in->role, in->cost, rssi);
 
     if (in->msg_type == EN2M_MSG_BEACON) {
-        en2m_consider_parent(from, in->role, in->cost, rssi);
+        if (en2m_consider_parent(from, in->role, in->cost, rssi)) {
+            out->parent_found = true;
+            en2m_mac_copy(out->parent.mac, s_ctx.parent_mac);
+            out->parent.cost = s_ctx.path_cost;
+            out->parent.rssi = rssi;
+        }
         return;
     }
 
     if (in->msg_type == EN2M_MSG_CMD && en2m_mac_equal(in->dest, s_ctx.self_mac)) {
-        if (s_ctx.config.on_command != NULL) {
-            s_ctx.config.on_command(in, s_ctx.config.user_ctx);
-        }
+        out->deliver_command = true;
         return;
     }
 
@@ -370,9 +495,20 @@ static void en2m_handle_rx(const uint8_t from[6], const en2m_pkt_t *in, int8_t r
         }
 
         en2m_learn_route(in->origin, from, in->hop);
-        if (s_ctx.config.on_uplink != NULL) {
-            s_ctx.config.on_uplink(in, rssi, from, s_ctx.config.user_ctx);
+
+        if (in->msg_type == EN2M_MSG_ACK && in->cmd_id != 0) {
+            uint8_t attempts = 0;
+            if (en2m_pending_resolve(in->origin, in->cmd_id, &attempts)) {
+                out->ack_resolved = true;
+                en2m_mac_copy(out->ack.mac, in->origin);
+                out->ack.transaction_id = in->cmd_id;
+                out->ack.attempts = attempts;
+            }
         }
+
+        out->uplink = true;
+        out->uplink_rssi = rssi;
+        en2m_mac_copy(out->uplink_from, from);
         return;
     }
 
@@ -387,21 +523,196 @@ static void en2m_handle_rx(const uint8_t from[6], const en2m_pkt_t *in, int8_t r
 
 static void en2m_espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    int8_t rssi;
+    en2m_item_t item = {.kind = EN2M_ITEM_RX};
 
     if (!s_ctx.inited || info == NULL || data == NULL || len < (int)offsetof(en2m_pkt_t, data)) {
         return;
     }
-
-    rssi = (info->rx_ctrl != NULL) ? info->rx_ctrl->rssi : 0;
-    if (s_ctx.lock != NULL) {
-        xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
+    if (len > (int)sizeof(en2m_pkt_t)) {
+        len = (int)sizeof(en2m_pkt_t);
     }
-    en2m_handle_rx(info->src_addr, (const en2m_pkt_t *)data, rssi);
-    if (s_ctx.lock != NULL) {
-        xSemaphoreGive(s_ctx.lock);
+
+    en2m_mac_copy(item.u.rx.src, info->src_addr);
+    item.u.rx.rssi = (info->rx_ctrl != NULL) ? info->rx_ctrl->rssi : 0;
+    memcpy(&item.u.rx.pkt, data, (size_t)len);
+
+    if (s_ctx.queue == NULL || xQueueSend(s_ctx.queue, &item, 0) != pdTRUE) {
+        s_ctx.rx_dropped++;
     }
 }
+
+/* ---- the en2m task ---- */
+
+esp_err_t en2m_task_post(const en2m_item_t *item, bool from_isr, BaseType_t *higher_prio_task_woken)
+{
+    BaseType_t ok;
+
+    if (item == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_ctx.queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (from_isr) {
+        ok = xQueueSendFromISR(s_ctx.queue, item, higher_prio_task_woken);
+    } else {
+        ok = xQueueSend(s_ctx.queue, item, 0);
+    }
+    return (ok == pdTRUE) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+bool en2m_task_running(void)
+{
+    return s_ctx.running;
+}
+
+bool en2m_task_is_current(void)
+{
+    return s_ctx.task != NULL && s_ctx.task == xTaskGetCurrentTaskHandle();
+}
+
+esp_err_t en2m_schedule(en2m_work_fn_t fn, void *arg)
+{
+    en2m_item_t item = {.kind = EN2M_ITEM_WORK};
+
+    if (fn == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    item.u.work.fn = fn;
+    item.u.work.arg = arg;
+    return en2m_task_post(&item, false, NULL);
+}
+
+esp_err_t en2m_schedule_from_isr(en2m_work_fn_t fn, void *arg, BaseType_t *higher_prio_task_woken)
+{
+    en2m_item_t item = {.kind = EN2M_ITEM_WORK};
+
+    if (fn == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    item.u.work.fn = fn;
+    item.u.work.arg = arg;
+    return en2m_task_post(&item, true, higher_prio_task_woken);
+}
+
+static void en2m_dispatch_rx(const en2m_item_t *item)
+{
+    en2m_rx_outcome_t outcome = {0};
+
+    en2m_lock();
+    en2m_handle_rx(item->u.rx.src, &item->u.rx.pkt, item->u.rx.rssi, &outcome);
+    en2m_unlock();
+
+    if (outcome.parent_found) {
+        en2m_event_post(EN2M_EVENT_PARENT_FOUND, &outcome.parent, sizeof(outcome.parent));
+        en2m_model_on_link_change(true);
+    }
+    if (outcome.ack_resolved) {
+        en2m_event_post(EN2M_EVENT_ACK_RECEIVED, &outcome.ack, sizeof(outcome.ack));
+    }
+    if (outcome.uplink && s_ctx.config.on_uplink != NULL) {
+        s_ctx.config.on_uplink(&item->u.rx.pkt, outcome.uplink_rssi, outcome.uplink_from,
+                               s_ctx.config.user_ctx);
+    }
+    if (outcome.deliver_command) {
+        if (s_ctx.config.on_command != NULL) {
+            s_ctx.config.on_command(&item->u.rx.pkt, s_ctx.config.user_ctx);
+        } else {
+            en2m_model_on_command_frame(&item->u.rx.pkt);
+        }
+    }
+}
+
+static void en2m_maintenance(int64_t now_ms)
+{
+    en2m_event_ack_t timeouts[EN2M_MAX_PENDING];
+    en2m_event_parent_t lost = {0};
+    en2m_event_dropped_t dropped = {0};
+    int timeout_count = 0;
+    bool parent_lost;
+    bool beacon_due = false;
+    bool hello_due = false;
+
+    en2m_lock();
+    parent_lost = en2m_expire_parent(&lost);
+    en2m_expire_routes();
+    en2m_pending_tick(timeouts, &timeout_count, EN2M_MAX_PENDING);
+
+    if (s_ctx.config.role != EN2M_ROLE_LEAF &&
+        (now_ms - s_ctx.last_beacon_us / 1000) >= EN2M_BEACON_MS_DEFAULT) {
+        s_ctx.last_beacon_us = now_ms * 1000;
+        beacon_due = true;
+    }
+    if (s_ctx.config.role != EN2M_ROLE_COORDINATOR &&
+        (now_ms - s_ctx.last_hello_us / 1000) >= EN2M_HEARTBEAT_MS) {
+        s_ctx.last_hello_us = now_ms * 1000;
+        hello_due = true;
+    }
+    if (s_ctx.rx_dropped != 0) {
+        dropped.total = s_ctx.rx_dropped;
+    }
+    if (beacon_due) {
+        en2m_send_beacon();
+    }
+    en2m_unlock();
+
+    if (hello_due) {
+        en2m_send_uplink(EN2M_MSG_HEARTBEAT, 0, NULL, 0);
+    }
+    if (parent_lost) {
+        en2m_event_post(EN2M_EVENT_PARENT_LOST, &lost, sizeof(lost));
+        en2m_model_on_link_change(false);
+    }
+    for (int i = 0; i < timeout_count; i++) {
+        char mac_str[18];
+        en2m_mac_to_str(timeouts[i].mac, mac_str);
+        ESP_LOGW(TAG, "command %u to %s was never acknowledged", timeouts[i].transaction_id, mac_str);
+        en2m_event_post(EN2M_EVENT_ACK_TIMEOUT, &timeouts[i], sizeof(timeouts[i]));
+    }
+    if (dropped.total != 0) {
+        s_ctx.rx_dropped = 0;
+        ESP_LOGW(TAG, "dropped %u frames, the queue could not keep up", (unsigned)dropped.total);
+        en2m_event_post(EN2M_EVENT_RX_DROPPED, &dropped, sizeof(dropped));
+    }
+}
+
+static void en2m_task(void *arg)
+{
+    en2m_item_t item;
+
+    (void)arg;
+    s_ctx.last_tick_ms = en2m_now_ms();
+
+    while (s_ctx.running) {
+        if (xQueueReceive(s_ctx.queue, &item, pdMS_TO_TICKS(EN2M_TICK_MS)) == pdTRUE) {
+            switch (item.kind) {
+            case EN2M_ITEM_RX:
+                en2m_dispatch_rx(&item);
+                break;
+            case EN2M_ITEM_WORK:
+                item.u.work.fn(item.u.work.arg);
+                break;
+            case EN2M_ITEM_ATTR:
+                en2m_attribute_set(item.u.attr.path.endpoint_id, item.u.attr.path.cluster_id,
+                                   item.u.attr.path.attribute_id, item.u.attr.value);
+                break;
+            }
+        }
+
+        int64_t now_ms = en2m_now_ms();
+        if (now_ms - s_ctx.last_tick_ms >= EN2M_TICK_MS) {
+            s_ctx.last_tick_ms = now_ms;
+            en2m_maintenance(now_ms);
+            en2m_model_tick(now_ms);
+        }
+    }
+
+    s_ctx.task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ---- bring-up ---- */
 
 static esp_err_t en2m_wifi_init(uint8_t channel)
 {
@@ -417,6 +728,8 @@ static esp_err_t en2m_wifi_init(uint8_t channel)
 
 esp_err_t en2m_mesh_init(const en2m_config_t *config)
 {
+    uint32_t stack = 4096;
+    uint8_t priority = 5;
     esp_err_t err;
     uint8_t bcast[6];
 
@@ -424,20 +737,21 @@ esp_err_t en2m_mesh_init(const en2m_config_t *config)
     ESP_RETURN_ON_FALSE(config->role == EN2M_ROLE_COORDINATOR || config->role == EN2M_ROLE_ROUTER ||
                             config->role == EN2M_ROLE_LEAF,
                         ESP_ERR_INVALID_ARG, TAG, "invalid role");
+    ESP_RETURN_ON_FALSE(!s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "already initialized");
 
     memset(&s_ctx, 0, sizeof(s_ctx));
     s_ctx.config = *config;
-    /* Map legacy field name if apps still set .user */
-    if (s_ctx.config.user_ctx == NULL) {
-        /* keep as-is */
-    }
     if (s_ctx.config.channel == 0) {
         s_ctx.config.channel = EN2M_WIFI_CHANNEL;
     }
     strncpy(s_ctx.name, (config->name != NULL) ? config->name : EN2M_DEVICE_NAME, sizeof(s_ctx.name) - 1);
     s_ctx.path_cost = 255;
+    s_ctx.next_cmd_id = 1;
+
     s_ctx.lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_ctx.lock != NULL, ESP_ERR_NO_MEM, TAG, "mutex alloc failed");
+    s_ctx.queue = xQueueCreate(EN2M_QUEUE_LEN, sizeof(en2m_item_t));
+    ESP_RETURN_ON_FALSE(s_ctx.queue != NULL, ESP_ERR_NO_MEM, TAG, "queue alloc failed");
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -469,6 +783,23 @@ esp_err_t en2m_mesh_init(const en2m_config_t *config)
     }
 
     s_ctx.inited = true;
+    s_ctx.running = true;
+
+    if (en2m_model_config() != NULL) {
+        if (en2m_model_config()->task_stack_size != 0) {
+            stack = en2m_model_config()->task_stack_size;
+        }
+        if (en2m_model_config()->task_priority != 0) {
+            priority = en2m_model_config()->task_priority;
+        }
+    }
+    if (xTaskCreate(en2m_task, "en2m", stack, NULL, priority, &s_ctx.task) != pdPASS) {
+        s_ctx.running = false;
+        s_ctx.inited = false;
+        ESP_LOGE(TAG, "could not create the en2m task");
+        return ESP_ERR_NO_MEM;
+    }
+
     en2m_emit_log("mesh init");
     return ESP_OK;
 }
@@ -478,9 +809,20 @@ void en2m_mesh_deinit(void)
     if (!s_ctx.inited) {
         return;
     }
+
+    s_ctx.running = false;
+    for (int i = 0; i < 20 && s_ctx.task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(EN2M_TICK_MS / 2));
+    }
+
     esp_now_deinit();
     esp_wifi_stop();
     esp_wifi_deinit();
+
+    if (s_ctx.queue != NULL) {
+        vQueueDelete(s_ctx.queue);
+        s_ctx.queue = NULL;
+    }
     if (s_ctx.lock != NULL) {
         vSemaphoreDelete(s_ctx.lock);
         s_ctx.lock = NULL;
@@ -490,45 +832,32 @@ void en2m_mesh_deinit(void)
 
 void en2m_mesh_loop(void)
 {
-    if (!s_ctx.inited) {
-        return;
-    }
+    static bool warned;
 
-    if (s_ctx.lock != NULL) {
-        xSemaphoreTake(s_ctx.lock, portMAX_DELAY);
-    }
-
-    en2m_expire_parent();
-    en2m_expire_routes();
-
-    if (s_ctx.config.role != EN2M_ROLE_LEAF) {
-        if ((en2m_now_ms() - s_ctx.last_beacon_us / 1000) >= EN2M_BEACON_MS_DEFAULT) {
-            s_ctx.last_beacon_us = en2m_now_us();
-            en2m_send_beacon();
-        }
-    }
-
-    if (s_ctx.config.role != EN2M_ROLE_COORDINATOR) {
-        if ((en2m_now_ms() - s_ctx.last_hello_us / 1000) > 30000) {
-            s_ctx.last_hello_us = en2m_now_us();
-            en2m_send_uplink(EN2M_MSG_HEARTBEAT, 0, NULL, 0);
-        }
-    }
-
-    if (s_ctx.lock != NULL) {
-        xSemaphoreGive(s_ctx.lock);
+    if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "en2m_mesh_loop() is obsolete: the transport runs its own task");
     }
 }
+
+/* ---- transmit ---- */
 
 esp_err_t en2m_send_uplink(uint8_t msg_type, uint16_t cmd_id, const uint8_t *data, uint8_t len)
 {
     en2m_pkt_t pkt;
     uint8_t bcast[6];
+    esp_err_t err;
 
     if (s_ctx.config.role == EN2M_ROLE_COORDINATOR) {
         return ESP_ERR_NOT_SUPPORTED;
     }
+    if (!s_ctx.inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    en2m_lock();
     if (!s_ctx.has_parent && msg_type != EN2M_MSG_HELLO && msg_type != EN2M_MSG_HEARTBEAT) {
+        en2m_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -550,23 +879,43 @@ esp_err_t en2m_send_uplink(uint8_t msg_type, uint16_t cmd_id, const uint8_t *dat
     }
 
     if (s_ctx.has_parent) {
-        return en2m_send_raw(s_ctx.parent_mac, &pkt);
+        err = en2m_send_raw(s_ctx.parent_mac, &pkt);
+    } else {
+        en2m_mac_broadcast(bcast);
+        err = en2m_send_raw(bcast, &pkt);
     }
+    en2m_unlock();
+    return err;
+}
 
-    en2m_mac_broadcast(bcast);
-    return en2m_send_raw(bcast, &pkt);
+uint16_t en2m_next_cmd_id(void)
+{
+    uint16_t id;
+
+    en2m_lock();
+    if (s_ctx.next_cmd_id == 0) {
+        s_ctx.next_cmd_id = 1;
+    }
+    id = s_ctx.next_cmd_id++;
+    en2m_unlock();
+    return id;
 }
 
 esp_err_t en2m_send_downlink(const uint8_t dest_mac[6], uint16_t cmd_id, const uint8_t *data, uint8_t len)
 {
     en2m_pkt_t pkt;
     uint8_t next[6];
+    esp_err_t err;
 
     ESP_RETURN_ON_FALSE(dest_mac != NULL, ESP_ERR_INVALID_ARG, TAG, "dest_mac is NULL");
     if (s_ctx.config.role != EN2M_ROLE_COORDINATOR) {
         return ESP_ERR_NOT_SUPPORTED;
     }
+    if (!s_ctx.inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
+    en2m_lock();
     en2m_fill_identity(&pkt);
     pkt.msg_type = EN2M_MSG_CMD;
     pkt.cmd_id = cmd_id;
@@ -584,15 +933,32 @@ esp_err_t en2m_send_downlink(const uint8_t dest_mac[6], uint16_t cmd_id, const u
         memcpy(pkt.data, data, len);
     }
 
-    if (en2m_lookup_route(dest_mac, next)) {
-        return en2m_send_raw(next, &pkt);
+    if (!en2m_lookup_route(dest_mac, next)) {
+        en2m_mac_copy(next, dest_mac);
     }
-    return en2m_send_raw(dest_mac, &pkt);
+    err = en2m_send_raw(next, &pkt);
+    if (err == ESP_OK && cmd_id != 0) {
+        en2m_pending_add(dest_mac, cmd_id, &pkt);
+    }
+    en2m_unlock();
+    return err;
 }
+
+/* ---- state accessors ---- */
 
 void en2m_set_pairing(bool enabled)
 {
+    en2m_event_pairing_t event = {.enabled = enabled};
+    bool changed;
+
+    en2m_lock();
+    changed = (s_ctx.pairing != enabled);
     s_ctx.pairing = enabled;
+    en2m_unlock();
+
+    if (changed) {
+        en2m_event_post(EN2M_EVENT_PAIRING_CHANGED, &event, sizeof(event));
+    }
 }
 
 bool en2m_get_pairing(void)
@@ -617,11 +983,13 @@ en2m_role_t en2m_get_role(void)
 
 void en2m_get_parent_mac(uint8_t out[6])
 {
+    en2m_lock();
     if (s_ctx.has_parent) {
         en2m_mac_copy(out, s_ctx.parent_mac);
     } else {
         en2m_mac_broadcast(out);
     }
+    en2m_unlock();
 }
 
 void en2m_get_self_mac(uint8_t out[6])
@@ -634,6 +1002,8 @@ void en2m_set_name(const char *name)
     if (name == NULL) {
         return;
     }
+    en2m_lock();
     strncpy(s_ctx.name, name, sizeof(s_ctx.name) - 1);
     s_ctx.name[sizeof(s_ctx.name) - 1] = '\0';
+    en2m_unlock();
 }
