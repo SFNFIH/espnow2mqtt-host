@@ -1,0 +1,49 @@
+# ESP-NOW mesh (en2m)
+# Aligned with ESP-IDF component conventions (Kconfig + sdkconfig)
+
+menu "ESP-NOW Mesh (en2m)"
+
+    config EN2M_WIFI_CHANNEL
+        int "Wi-Fi channel used by ESP-NOW"
+        range 1 14
+        default 1
+        help
+            All nodes (coordinator / router / leaf) must use the same channel.
+            Nodes do not join a home AP; the radio is only used for ESP-NOW.
+
+    config EN2M_HOP_LIMIT
+        int "Maximum mesh hop count"
+        range 1 16
+        default 8
+
+    config EN2M_MAX_ROUTES
+        int "Maximum reverse routes"
+        range 4 64
+        default 32
+
+    config EN2M_MAX_NEIGHBORS
+        int "Maximum remembered neighbors"
+        range 4 32
+        default 16
+
+    config EN2M_BEACON_INTERVAL_MS
+        int "Beacon interval (ms) for coordinator/router"
+        range 500 60000
+        default 5000
+
+    config EN2M_PARENT_STALE_MS
+        int "Parent stale timeout (ms)"
+        range 5000 120000
+        default 20000
+
+    config EN2M_ROUTE_STALE_MS
+        int "Route stale timeout (ms)"
+        range 10000 600000
+        default 120000
+
+    config EN2M_OFFLINE_MS
+        int "Host-visible offline timeout (ms)"
+        range 10000 600000
+        default 90000
+
+endmenu

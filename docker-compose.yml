@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: espnow2mqtt-bridge
+    container_name: espnow2mqtt-host
     restart: unless-stopped
     devices:
       - /dev/ttyACM0:/dev/ttyACM0

@@ -1,0 +1,15 @@
+dependencies:
+  idf: ">=5.0"
+
+description: ESP-NOW mesh for ESP32-S3 USB coordinator (en2m transport)
+url: https://github.com/SFNFIH/espnow2mqtt-host
+issues: https://github.com/SFNFIH/espnow2mqtt-host/issues
+documentation: https://github.com/SFNFIH/espnow2mqtt-host/blob/main/components/en2m/README.md
+repository: https://github.com/SFNFIH/espnow2mqtt-host.git
+version: 0.4.0
+license: MIT
+tags:
+  - espnow
+  - mesh
+  - homeassistant
+  - coordinator

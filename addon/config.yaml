@@ -2,7 +2,7 @@ name: "ESP-NOW 2 MQTT"
 version: "0.3.0"
 slug: espnow2mqtt
 description: "USB ESP32-S3 coordinator bridge for ESP-NOW devices (use with espnow2mqtt-ha integration)"
-url: "https://github.com/SFNFIH/espnow2mqtt-bridge"
+url: "https://github.com/SFNFIH/espnow2mqtt-host"
 arch:
   - amd64
   - aarch64

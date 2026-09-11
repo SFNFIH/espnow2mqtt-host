@@ -3,7 +3,7 @@ FROM ${BUILD_FROM}
 
 WORKDIR /app
 
-# Build from espnow2mqtt-bridge repository root:
+# Build from espnow2mqtt-host repository root:
 #   docker build -f addon/Dockerfile .
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
