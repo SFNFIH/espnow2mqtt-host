@@ -251,6 +251,16 @@ static void en2m_dm_add_default_attrs(struct en2m_cluster *cluster)
     case EN2M_CLUSTER_COLOR_CONTROL:
         en2m_dm_add_attr(cluster, EN2M_ATTR_COLOR_TEMPERATURE_MIREDS, en2m_u16(300), true);
         break;
+    case EN2M_CLUSTER_SWITCH:
+        en2m_dm_add_attr(cluster, EN2M_ATTR_NUMBER_OF_POSITIONS, en2m_u8(2), false);
+        en2m_dm_add_attr(cluster, EN2M_ATTR_CURRENT_POSITION, en2m_u8(0), false);
+        en2m_dm_add_attr(cluster, EN2M_ATTR_MULTI_PRESS_MAX, en2m_u8(2), false);
+        /* Persisted so a press counter survives a reboot. If it reset to zero
+         * the receiver would see the count go backwards and could read that as
+         * a fresh press. */
+        en2m_dm_add_attr(cluster, EN2M_ATTR_PRESS_COUNT, en2m_u32(0), true);
+        en2m_dm_add_attr(cluster, EN2M_ATTR_PRESS_ACTION, en2m_enum8(EN2M_PRESS_SHORT), false);
+        break;
     case EN2M_CLUSTER_BOOLEAN_STATE:
         en2m_dm_add_attr(cluster, EN2M_ATTR_STATE_VALUE, en2m_bool(false), false);
         break;
@@ -450,6 +460,9 @@ esp_err_t en2m_endpoint_add_device_type(en2m_endpoint_t *endpoint, en2m_device_t
         break;
     case EN2M_DEVICE_TYPE_THERMOSTAT:
         en2m_cluster_create(endpoint, EN2M_CLUSTER_THERMOSTAT);
+        break;
+    case EN2M_DEVICE_TYPE_GENERIC_SWITCH:
+        en2m_cluster_create(endpoint, EN2M_CLUSTER_SWITCH);
         break;
     default:
         return ESP_ERR_INVALID_ARG;
@@ -674,6 +687,43 @@ esp_err_t en2m_report_energy(uint8_t endpoint_id, int64_t milliwatt_hours)
 {
     return en2m_attribute_set(endpoint_id, EN2M_CLUSTER_ELECTRICAL_POWER, EN2M_ATTR_ENERGY_MWH,
                               en2m_i64(milliwatt_hours));
+}
+
+esp_err_t en2m_report_button(uint8_t endpoint_id, en2m_press_action_t action)
+{
+    en2m_value_t count = {0};
+    esp_err_t err;
+
+    err = en2m_attribute_get(endpoint_id, EN2M_CLUSTER_SWITCH, EN2M_ATTR_PRESS_COUNT, &count);
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* Set the action first: the counter is what triggers the report, so it has
+     * to be the last thing to change or a receiver could see the new count
+     * paired with the previous action. */
+    err = en2m_attribute_set(endpoint_id, EN2M_CLUSTER_SWITCH, EN2M_ATTR_PRESS_ACTION,
+                             en2m_enum8((uint8_t)action));
+    if (err != ESP_OK) {
+        return err;
+    }
+    return en2m_attribute_set(endpoint_id, EN2M_CLUSTER_SWITCH, EN2M_ATTR_PRESS_COUNT,
+                              en2m_u32((uint32_t)en2m_value_as_int(&count) + 1u));
+}
+
+/** Packs an endpoint and an action into the single pointer a work item carries. */
+static void en2m_button_work(void *arg)
+{
+    uintptr_t packed = (uintptr_t)arg;
+
+    en2m_report_button((uint8_t)(packed >> 8), (en2m_press_action_t)(packed & 0xFF));
+}
+
+esp_err_t en2m_report_button_from_isr(uint8_t endpoint_id, en2m_press_action_t action,
+                                      BaseType_t *higher_prio_task_woken)
+{
+    uintptr_t packed = ((uintptr_t)endpoint_id << 8) | ((uintptr_t)action & 0xFF);
+
+    return en2m_schedule_from_isr(en2m_button_work, (void *)packed, higher_prio_task_woken);
 }
 
 /* ---- read refresh ---- */

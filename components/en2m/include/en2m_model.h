@@ -99,6 +99,7 @@ typedef enum {
     EN2M_DEVICE_TYPE_WINDOW_COVERING,
     EN2M_DEVICE_TYPE_DOOR_LOCK,
     EN2M_DEVICE_TYPE_THERMOSTAT,
+    EN2M_DEVICE_TYPE_GENERIC_SWITCH,
 } en2m_device_type_t;
 
 /** Work item deferred onto the en2m task. */

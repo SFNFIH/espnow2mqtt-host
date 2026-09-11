@@ -31,6 +31,7 @@ typedef enum {
     EN2M_CLUSTER_IDENTIFY = 0x0003,
     EN2M_CLUSTER_ON_OFF = 0x0006,
     EN2M_CLUSTER_LEVEL_CONTROL = 0x0008,
+    EN2M_CLUSTER_SWITCH = 0x003B,
     EN2M_CLUSTER_BOOLEAN_STATE = 0x0045,
     EN2M_CLUSTER_SMOKE_CO = 0x005C,
     EN2M_CLUSTER_DOOR_LOCK = 0x0101,
@@ -54,6 +55,18 @@ typedef enum {
     EN2M_ATTR_ON_OFF = 0x0000,
     /* LevelControl: 0–254 */
     EN2M_ATTR_CURRENT_LEVEL = 0x0000,
+    /* Switch */
+    EN2M_ATTR_NUMBER_OF_POSITIONS = 0x0000,
+    EN2M_ATTR_CURRENT_POSITION = 0x0001,
+    EN2M_ATTR_MULTI_PRESS_MAX = 0x0002,
+    /* Switch, transport-specific. Matter delivers presses as events, which
+     * this protocol has no equivalent for: every uplink is a full state
+     * snapshot and a retained one at that. A press is therefore carried as a
+     * monotonically increasing counter plus the kind of the last press, so a
+     * receiver can tell a new press from a resend of the previous report. See
+     * ::en2m_report_button. */
+    EN2M_ATTR_PRESS_COUNT = 0xFF00,
+    EN2M_ATTR_PRESS_ACTION = 0xFF01,
     /* ColorControl */
     EN2M_ATTR_COLOR_TEMPERATURE_MIREDS = 0x0007,
     /* BooleanState / Occupancy / measurement clusters */
@@ -105,6 +118,20 @@ typedef enum {
     EN2M_LOCK_UNLOCKED = 0,
     EN2M_LOCK_LOCKED = 1,
 } en2m_lock_state_t;
+
+/**
+ * @brief Kind of button press, as the Home Assistant event platform names them.
+ *
+ * These map onto Matter's Switch events — InitialPress/ShortRelease,
+ * MultiPressComplete with two presses, LongPress, LongRelease — collapsed to
+ * the four an automation actually branches on.
+ */
+typedef enum {
+    EN2M_PRESS_SHORT = 0,  /**< A single short press: "press" */
+    EN2M_PRESS_DOUBLE = 1, /**< Two presses in quick succession: "double_press" */
+    EN2M_PRESS_LONG = 2,   /**< Held past the long-press threshold: "long_press" */
+    EN2M_PRESS_RELEASE = 3,/**< Let go after a long press: "release" */
+} en2m_press_action_t;
 
 /** Value discriminator. */
 typedef enum {
@@ -325,6 +352,31 @@ esp_err_t en2m_report_cover_position(uint8_t endpoint_id, uint8_t closed_percent
 esp_err_t en2m_report_fan(uint8_t endpoint_id, en2m_fan_mode_t mode, uint8_t percent);
 esp_err_t en2m_report_power(uint8_t endpoint_id, int32_t milliwatts);
 esp_err_t en2m_report_energy(uint8_t endpoint_id, int64_t milliwatt_hours);
+
+/**
+ * @brief Record one button press and report it.
+ *
+ * Increments ::EN2M_ATTR_PRESS_COUNT and stores @p action, which serializes to
+ * `{"button": <count>, "button_action": "double_press"}`. The counter is what
+ * makes a press detectable: reports are full snapshots and the state topic is
+ * retained, so two identical payloads are indistinguishable from one payload
+ * sent twice. Pressing the same button twice must therefore change *something*,
+ * and the counter is that something. Callers never manage it.
+ *
+ * Presses arriving faster than `min_report_interval_ms` coalesce into one
+ * report. The counter still advances once per press, so a receiver can see
+ * from the gap that it missed some.
+ */
+esp_err_t en2m_report_button(uint8_t endpoint_id, en2m_press_action_t action);
+
+/**
+ * @brief ISR-safe ::en2m_report_button, for a GPIO button driver's callback.
+ *
+ * The increment happens on the en2m task, so the counter cannot be torn by two
+ * presses racing on different cores.
+ */
+esp_err_t en2m_report_button_from_isr(uint8_t endpoint_id, en2m_press_action_t action,
+                                      BaseType_t *higher_prio_task_woken);
 
 #ifdef __cplusplus
 }
