@@ -1,0 +1,23 @@
+services:
+  espnow2mqtt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: espnow2mqtt-bridge
+    restart: unless-stopped
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    environment:
+      PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - -m
+      - espnow2mqtt
+      - --port
+      - /dev/ttyACM0
+      - --mqtt-host
+      - homeassistant
+      - --mqtt-port
+      - "1883"
+    volumes:
+      - ./data:/app/data

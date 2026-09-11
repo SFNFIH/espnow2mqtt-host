@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "espnow2mqtt"
+version = "0.1.0"
+description = "ESP-NOW to MQTT bridge for Home Assistant (USB coordinator)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "paho-mqtt>=2.0.0",
+  "pyserial>=3.5",
+]
+
+[project.scripts]
+espnow2mqtt = "espnow2mqtt.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["espnow2mqtt*"]
