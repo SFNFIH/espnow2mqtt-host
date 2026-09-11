@@ -299,34 +299,124 @@ def _handle_serial(self, line: str) -> None:
 | `log` | `LOG.info("coord: %s", msg["msg"])` | **不进 MQTT**。S3 的 mesh 日志只出现在 Bridge 的 stdout |
 | `device` | `_on_device_event()` | 上下线、availability、`devices.json` |
 | `state` | `_on_state()` | 状态合并 + 发 MQTT |
-| `ack` | `_on_ack()` | 只记日志，见下 |
+| `ack` | `_on_ack()` | 日志 + 发 `<slug>/command_result`，见下 |
 | 其他 | `LOG.debug("ignored")` | 无。协议向前兼容：S3 以后加新行类型不会让老 Bridge 崩 |
 
 **非 JSON 行走 `LOG.debug` 静默丢弃**，这是故意的：S3 复位时 ROM bootloader 会往
 USB 喷一堆非 JSON 的启动信息，不该当成错误刷屏。所以调试"S3 到底在说什么"时
 **必须开 `-v`**，否则你看不到这些行。
 
-`_on_ack` 只做日志，不发 MQTT：
+`_on_ack` 记日志，然后把协调器的裁决重新发布到 MQTT：
 
 ```python
 def _on_ack(self, msg: dict[str, Any]) -> None:
-    if msg.get("ok"):
-        LOG.debug("ack: %s", msg)
+    cid = msg.get("id")
+    ok = bool(msg.get("ok"))
+    error = str(msg.get("error") or "") or None
+    pending = self.pending.pop(cid, None) if isinstance(cid, int) else None
+    self._expire_pending()
+
+    mac = str(msg.get("mac") or (pending.mac if pending else ""))
+    dev = self.devices.get(mac)
+    slug = self._slug(dev) if dev else (pending.slug if pending else "")
+
+    if ok:
+        LOG.debug("command %s to %s acked", cid, slug or mac or "?")
+    else:
+        LOG.warning(
+            "command %s to %s failed: %s", cid, slug or mac or "?", error or "unknown"
+        )
+
+    if not slug:
+        # An ack for something we cannot attribute — most likely a command
+        # issued from the coordinator's own console rather than from us.
         return
-    LOG.warning("command %s to %s failed: %s",
-                msg.get("id"), msg.get("mac"), msg.get("error") or "unknown")
+    result: dict[str, Any] = {"id": cid, "ok": ok, "mac": mac or None}
+    if error:
+        result["error"] = error
+    if pending is not None:
+        result["payload"] = pending.payload
+        result["elapsed_ms"] = int((time.time() - pending.sent_at) * 1000)
+    self.mqtt.publish(
+        f"{self.base}/{slug}/command_result",
+        json.dumps(result),
+        retain=False,
+    )
 ```
 
-> **为什么 ACK 不进 MQTT？**
+主题格式和字段见 [mqtt.md §7](mqtt.md#11-slugcommand_result)。
+
+> **为什么状态上报不够？**
 >
-> 因为不需要。设备 ACK 之后会紧跟一条新的状态上报（见
+> 成功的命令确实会紧跟一条新的状态上报（见
 > [PROTOCOL.md](../protocol/PROTOCOL.md) 的"Acknowledgement and retries"），
-> 那条状态会走 `_on_state` 发到 `<slug>/state`。HA 看到的是**状态变了**，
-> 这比"命令被确认了"更有用，也更符合 MQTT 的状态语义。
+> 所以 HA 能从"状态变了"推出"命令成功了"。
+> **但失败的命令没有任何后续上报**——状态不变和"命令还在路上"、
+> "设备本来就是这个值"在 MQTT 上完全无法区分。
 >
-> 失败的 ACK（`ok:false`）走 `LOG.warning`，所以**命令失败只能在 Bridge 日志里看到**，
-> HA 侧的表现是"实体状态没变"。这是当前实现的一个缺口：
-> 如果你想在 HA 里看到"命令失败"，需要自己加一个 `bridge/<slug>/last_error` 之类的主题。
+> 而且有一类命令根本没有可读状态（`identify` 让设备闪灯），
+> 对它们来说状态上报一点信息也提供不了。
+>
+> **0.3.x 里 `_on_ack` 只写一行日志就结束了。** 失败的命令在
+> 这个进程之外完全不可见，HA 侧的唯一表现是"实体状态没变"。
+
+### `pending`：为了能说出是哪条命令失败了
+
+协调器的 ack 里只有 `id`、`ok`、`error`、`mac`——**没有原始命令内容**。
+光说"命令 7 失败了"对使用者没用，所以 Bridge 自己记着发过什么：
+
+```python
+PENDING_TTL_S = 30.0
+
+@dataclass
+class PendingCommand:
+    mac: str
+    slug: str
+    payload: dict[str, Any]
+    sent_at: float
+```
+
+`_on_cmd`（MQTT `<slug>/set` 的处理）往 `self.pending[cmd_id]` 存一条，
+`_on_ack` 把它取出来，于是 `command_result` 里能带上
+`payload`（原始命令）和 `elapsed_ms`（往返耗时）。
+
+`pending` 还解决了一个归属问题：ack 里的 `mac` 字段在
+`send_fail` 的情况下**可能是空的**（S3 连路由都没查到）。
+这时 `pending.mac` / `pending.slug` 是唯一的线索。
+
+| 字段来源优先级 | |
+|---|---|
+| `mac` | ack 里的 → `pending.mac` → `""` |
+| `slug` | 按 `mac` 查设备表 → `pending.slug` → `""` |
+
+两者都拿不到就**不发 MQTT**，只留日志。那种 ack 通常是
+协调器自己的串口控制台发出的命令，和 Bridge 无关。
+
+### `_expire_pending`：协调器重启时不泄漏
+
+```python
+def _expire_pending(self) -> None:
+    """Forget commands the coordinator never acked.
+
+    It always should — it acks with `timeout` once the retries run out — but
+    a coordinator reset mid-command would otherwise leak an entry forever.
+    """
+    if not self.pending:
+        return
+    deadline = time.time() - PENDING_TTL_S
+    stale = [cid for cid, p in self.pending.items() if p.sent_at < deadline]
+    for cid in stale:
+        LOG.debug("forgetting unacked command %s", cid)
+        del self.pending[cid]
+```
+
+正常情况下每条命令都会被 ack（重传耗尽后协调器会回
+`error: "timeout"`），所以 `pending` 不会长。
+但协调器在命令中途复位的话那条记录就永远等不到 ack 了。
+30 秒的 TTL 远大于 1.6 秒的重传窗口，所以不会误删还在飞的命令。
+
+清理时机是**每次收到 ack 时顺手做一次**，没有定时器——
+这样即使 Bridge 长时间没有下行命令，也不会有后台任务空转。
 
 `_on_device_event` 处理三种 `event`：
 
@@ -529,16 +619,21 @@ S3 的 `device`/`offline` 事件（S3 侧 `EN2M_OFFLINE_MS` 超时，见
 `caps` 决定 `--ha-discovery` 要建哪些实体。它有**三级 fall-through**：
 
 ```python
-def _parse_caps(self, payload: dict[str, Any], model: str = "") -> list[str]:
+@staticmethod
+def _explicit_caps(payload: dict[str, Any]) -> list[str]:
+    """The caps the device stated outright, if the report had room for them."""
     caps_raw = payload.get("caps")
-    caps: list[str] = []
     if isinstance(caps_raw, list):
-        caps = [str(c).strip().lower() for c in caps_raw if str(c).strip()]
-    elif isinstance(caps_raw, str) and caps_raw.strip():
-        caps = [c.strip().lower() for c in caps_raw.split(",") if c.strip()]
+        return [str(c).strip().lower() for c in caps_raw if str(c).strip()]
+    if isinstance(caps_raw, str) and caps_raw.strip():
+        return [c.strip().lower() for c in caps_raw.split(",") if c.strip()]
+    return []
+
+def _parse_caps(self, payload: dict[str, Any], model: str = "") -> list[str]:
+    caps = self._explicit_caps(payload)
     if caps:
         return caps
-    # 从 payload 的 key / model 名推断
+    # Infer from payload keys / model
     inferred: list[str] = []
     for key in ("temperature", "humidity", "switch", "contact", "button", "power", "energy"):
         if key in payload:
@@ -574,16 +669,60 @@ def _parse_caps(self, payload: dict[str, Any], model: str = "") -> list[str]:
   所以 `merged` 里也没有 `caps`）
 - 你在用第三方/手搓固件，不发 `caps`
 
-caps 变化会强制重建 discovery：
+`_explicit_caps` 被单独拆出来，是因为**"设备明说的"和"我们猜的"
+必须区别对待**。合并规则在 `_update_caps` 里：
 
 ```python
-if new_caps and new_caps != dev.caps:
-    dev.caps = new_caps
-    dev.discovered = False      # 下面会重新 _publish_discovery
+def _update_caps(self, dev: Device, payload: dict[str, Any]) -> None:
+    """Fold a report's capabilities into what we already knew.
+
+    A device drops `caps` from its report when the 160-byte budget gets
+    tight, and what we can infer from the remaining keys is much coarser
+    than what the firmware would have told us. Replacing the stored caps
+    with that guess used to make capabilities flicker — a light would be
+    downgraded to a plain switch for one report. So only an explicit list
+    may replace; a guess may only add.
+    """
+    explicit = self._explicit_caps(payload)
+    if explicit:
+        new_caps = explicit
+    else:
+        new_caps = list(dev.caps)
+        for cap in self._parse_caps(payload, dev.model):
+            if cap not in new_caps:
+                new_caps.append(cap)
+    if new_caps != dev.caps:
+        dev.caps = new_caps
+        dev.discovered = False      # 下面会重新 _publish_discovery
 ```
 
-`and new_caps` 这个条件很关键：**空的 `new_caps` 不会清掉已知的 `caps`**。
-否则一条被挤掉了 `caps` 的上报就会把设备的能力擦掉、并触发一次没有实体的 discovery 重建。
+| 这条上报 | 对已存的 `caps` 做什么 |
+|---|---|
+| 带显式 `caps` 列表 | **整个替换**。设备是权威，能力真的可以变少 |
+| 没带 `caps`，但能猜出点东西 | **只增不减**。猜出来的比设备明说的粗得多，不许它降级 |
+| 没带 `caps`，也猜不出东西 | 什么都不做 |
+
+第二行是关键。一个调光灯的上报在 160 字节预算紧张时会被砍成
+`{"switch":"ON","brightness":180}`——`caps` 不见了。
+这时级 2 的推断只能看出 `switch`（`brightness` 不在那 7 个 key 里）。
+
+> **0.3.x 里这一条会直接替换：**
+>
+> ```python
+> if new_caps and new_caps != dev.caps:
+>     dev.caps = new_caps
+> ```
+>
+> `and new_caps` 保住了"全空不覆盖"的情况，
+> 但**猜出来的非空结果会盖掉设备明说过的**。
+> 于是一个 `caps: ["light"]` 的调光灯，在某一条挤掉了 caps 的上报之后
+> 变成 `caps: ["switch"]`，下一条完整上报又变回 `["light"]`——
+> **能力在两个值之间抖动**，而且每次抖动都会
+> `dev.discovered = False`，触发一次 discovery 重建。
+>
+> HA 集成 0.4.0 加了"cap 消失就删实体"之后，这个抖动的代价从
+> "多一次 discovery 重建"变成了**实体被反复创建和删除**，
+> 所以这里必须先修。
 
 ---
 

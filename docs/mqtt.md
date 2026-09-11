@@ -21,9 +21,10 @@ Bridge 和 Home Assistant 之间只通过 MQTT 说话。这份文档是**每一�
 8. [设备状态字段](#8-设备状态字段)
 9. [`<slug>/<key>` 扁平主题](#9-slugkey-扁平主题)
 10. [`<slug>/set`](#10-slugset)
-11. [MQTT Discovery 主题](#11-mqtt-discovery-主题)
-12. [retain 语义总结](#12-retain-语义总结)
-13. [常用命令行](#13-常用命令行)
+11. [`<slug>/command_result`](#11-slugcommand_result)
+12. [MQTT Discovery 主题](#12-mqtt-discovery-主题)
+13. [retain 语义总结](#13-retain-语义总结)
+14. [常用命令行](#14-常用命令行)
 
 ---
 
@@ -39,6 +40,7 @@ Bridge 和 Home Assistant 之间只通过 MQTT 说话。这份文档是**每一�
 | `<base>/<slug>/availability` | ✓ | 0 | `online` / `offline` |
 | `<base>/<slug>/state` | ✓ | 0 | 合并后的状态 JSON |
 | `<base>/<slug>/<key>` | ✗ | 0 | 单个字段的 `str()` 值 |
+| `<base>/<slug>/command_result` | ✗ | 0 | 一条下行命令的结局 |
 | `<disc>/…/config` | ✓ | 0 | MQTT Discovery，**仅 `--ha-discovery`** |
 
 **Bridge 订阅**
@@ -508,11 +510,13 @@ Bridge 用自增的 `cmd_id`（从 1 开始），**非零**，所以 S3 会重�
 
 ### 失败怎么看
 
-失败只在 Bridge 日志里：
+命令的结局会回到 MQTT 上，见 [§11](#11-slugcommand_result)。
+
+Bridge 日志里同时有一行：
 
 ```
-WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
-WARNING espnow2mqtt: command 8 to AA:BB:CC:DD:EE:FF failed: send_fail
+WARNING espnow2mqtt: command 7 to living_room failed: timeout
+WARNING espnow2mqtt: command 8 to living_room failed: send_fail
 WARNING espnow2mqtt: unknown device slug old_name
 ```
 
@@ -522,8 +526,8 @@ WARNING espnow2mqtt: unknown device slug old_name
 | `failed: send_fail` | S3 根本没发出去。路由表里没这个 MAC，或 pending 表满 |
 | `unknown device slug X` | Bridge 的设备表里没有叫 `X` 的设备。最常见是 HA 里留着一个改过名/已移除的旧实体 |
 
-**MQTT 上没有 `last_error` 之类的主题**，这是当前实现的一个缺口。
-要让 HA 看到命令失败，得自己在 `_on_ack` 里加一次 publish。
+最后一种**不会**产生 `command_result`——命令根本没被发出去，
+也没有 `id` 可言。
 
 ### 别往 `<slug>/set` 发 retained 消息
 
@@ -539,7 +543,110 @@ mosquitto_pub -t espnow2mqtt/living_room/set -r -n
 
 ---
 
-## 11. MQTT Discovery 主题
+## 11. `<slug>/command_result`
+
+```
+espnow2mqtt/living_room/command_result
+```
+
+| | |
+|---|---|
+| 方向 | **Bridge 发布** |
+| retain | **✗ 绝对不 retain** |
+| QoS | 0 |
+| 什么时候发 | 每收到一条能归属到设备的 `ack` USB 行 |
+| 发布者 | `_on_ack()`（见 [bridge.md](bridge.md#5-串口读取_serial_loop-与-_handle_serial)） |
+
+一条下行命令的结局。**成功和失败都发。**
+
+```json
+{"id": 7, "ok": true, "mac": "AA:BB:CC:DD:EE:FF",
+ "payload": {"switch": "ON"}, "elapsed_ms": 142}
+```
+
+```json
+{"id": 8, "ok": false, "mac": "AA:BB:CC:DD:EE:FF", "error": "timeout",
+ "payload": {"brightness": 200}, "elapsed_ms": 1642}
+```
+
+| 字段 | 类型 | 总是有 | 含义 |
+|---|---|:-:|---|
+| `id` | number | ✓ | 命令序号，和 `<slug>/set` 触发的那条 USB `cmd` 行的 `id` 一致 |
+| `ok` | bool | ✓ | 协调器是否收到了设备的链路层确认 |
+| `mac` | string \| null | ✓ | 目标 MAC。`send_fail` 时协调器可能不填，Bridge 会用 `pending` 里的值补上；都没有则为 `null` |
+| `error` | string | 失败时 | `timeout` / `send_fail` / … 原样转发协调器的字符串 |
+| `payload` | object | 见下 | **原始命令内容**，即 `<slug>/set` 的 payload |
+| `elapsed_ms` | number | 见下 | 从 publish 到 ack 的往返耗时 |
+
+### 11.1 `payload` 和 `elapsed_ms` 可能缺失
+
+这两个字段来自 Bridge 的 `pending` 表，那个表有 **30 秒 TTL**。
+协调器在命令中途复位、ack 迟到超过 30 秒的话，条目已经被清掉了，
+这两个字段就不会出现。`id` / `ok` / `mac` / `error` 始终在。
+
+订阅方要按可选字段处理：
+
+```jinja
+{{ value_json.payload | default({}) }}
+```
+
+### 11.2 为什么不 retain
+
+命令结果是**一次性事件**，不是状态。retain 了会有两个后果：
+
+1. HA 每次重连都会重新收到最后一条结果，于是**重启就弹一次"命令失败"告警**
+2. 多个订阅者看到的"最新结果"可能早就过期了
+
+规则和 `<slug>/set` 一样：**状态 retain，命令和命令结果不 retain。**
+
+### 11.3 `ok: true` 不等于"设备照办了"
+
+`ok` 反映的是**链路层**：协调器把帧送到了设备并收到了 ESP-NOW 确认。
+设备的应用层完全可以在那之后拒绝这个值——写回调返回非 `ESP_OK`，
+属性不提交，状态也就不变。
+
+| 现象 | `command_result` |
+|---|---|
+| 状态变了 | `ok: true` |
+| 状态不变，因为命令没送到 | `ok: false` |
+| 状态不变，因为设备**拒绝**了那个值 | **`ok: true`** |
+
+第三行的常见原因：值超出范围、往只读属性写、设备上没有那个属性
+（往不支持色温的灯发 `color_temp`）、枚举值固件没实现
+（风扇的 `smart`）。这些只能在设备的 `idf.py monitor` 里看到。
+
+所以关键操作要**同时**看 `command_result` 和 `<slug>/state`。
+
+### 11.4 无法归属的 ack 不会发布
+
+如果 ack 里的 `mac` 查不到设备、`pending` 里也没有对应的 `id`，
+Bridge 只记日志、不发 MQTT。那种 ack 通常是**协调器自己的串口控制台
+发出的命令**产生的，和 Bridge 无关，发出去只会让订阅者困惑。
+
+### 11.5 订阅示例
+
+```bash
+# 看所有命令的结局
+mosquitto_sub -t 'espnow2mqtt/+/command_result' -v
+
+# 只看失败的
+mosquitto_sub -t 'espnow2mqtt/+/command_result' -v \
+  | grep '"ok": false'
+```
+
+HA 集成订阅这个主题，把失败的转成 `espnow2mqtt_command_failed`
+事件，见
+[ha 仓库 docs/usage.md §7](https://github.com/SFNFIH/espnow2mqtt-ha/blob/main/docs/usage.md#7-命令的成败反馈)。
+
+> **0.3.x 的 Bridge 不发这个主题。** 协调器的 ack 到了 `_on_ack`
+> 就停下了，只写一行日志。命令失败在这个进程之外完全不可见。
+> 如果你的 HA 集成是 0.4.0 但 Bridge 是旧版，
+> 集成会正常工作，只是永远收不到 `command_result`，
+> 也就永远不会 fire 失败事件。
+
+---
+
+## 12. MQTT Discovery 主题
 
 **只在 `--ha-discovery` 开启时发布。默认关闭。**
 为什么默认关、覆盖面有多小，见 [bridge.md §9](bridge.md#9-ha_discovery为什么默认关)。
@@ -629,7 +736,7 @@ mosquitto_pub -t homeassistant/sensor/espnow2mqtt_living_room_rssi/config -r -n
 
 ---
 
-## 12. retain 语义总结
+## 13. retain 语义总结
 
 | 主题 | retain | 为什么 |
 |---|:-:|---|
@@ -647,7 +754,7 @@ mosquitto_pub -t homeassistant/sensor/espnow2mqtt_living_room_rssi/config -r -n
 
 ---
 
-## 13. 常用命令行
+## 14. 常用命令行
 
 ### 看全局
 

@@ -327,10 +327,26 @@ pending 表满了）：
 Bridge 对 `ok:true` 只 `LOG.debug`，对 `ok:false` 发 `LOG.warning`：
 
 ```
-WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: timeout
+WARNING espnow2mqtt: command 7 to living_room failed: timeout
 ```
 
-**失败不进 MQTT。** 见 [bridge.md](bridge.md#5-串口读取_serial_loop-与-_handle_serial)。
+**两种都会被转发到 MQTT** 的 `<base>/<slug>/command_result`，
+并且带上 Bridge 自己记着的原始命令内容：
+
+```json
+{"id":7,"ok":false,"mac":"AA:BB:CC:DD:EE:FF","error":"timeout",
+ "payload":{"switch":"ON"},"elapsed_ms":1642}
+```
+
+这是 ack 这条 USB 行唯一的用途——成功的命令本来就会紧跟一条新的状态上报，
+而失败的命令什么都不会产生。主题格式见
+[mqtt.md §11](mqtt.md#11-slugcommand_result)，
+Bridge 侧的实现见
+[bridge.md](bridge.md#5-串口读取_serial_loop-与-_handle_serial)。
+
+> **注意 ack 里没有原始命令内容**，只有 `id` / `ok` / `mac` / `error`。
+> `payload` 和 `elapsed_ms` 是 Bridge 从自己的 `pending` 表补上的，
+> 所以协调器中途复位、ack 迟到超过 30 秒的话这两个字段会缺失。
 
 ---
 

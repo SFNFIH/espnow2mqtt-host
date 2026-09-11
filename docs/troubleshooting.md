@@ -655,6 +655,31 @@ mosquitto_sub -t espnow2mqtt/living_room/availability -C 1
 
 往 `<slug>/set` 发命令，设备没反应。
 
+### 7.0 先看 `command_result`
+
+这一节剩下的条目都能从一个主题上分诊出来：
+
+```bash
+mosquitto_sub -t 'espnow2mqtt/+/command_result' -v
+```
+
+然后发一条命令。
+
+| 结果 | 去哪 |
+|---|---|
+| **完全没输出** | 命令没到 Bridge → [§7.1](#71-bridge-收到了吗)；或者 slug 认不出来 → [§7.2](#72-unknown-device-slug) |
+| `{"ok":false,"error":"send_fail"}` | [§7.3](#73-failed-send_fail) |
+| `{"ok":false,"error":"timeout"}` | [§7.4](#74-failed-timeout) |
+| `{"ok":true}` **但设备没反应** | 设备拒绝了那个值 → [§7.6](#76-ack-成功但状态没变) |
+
+失败的结果里还带着 `payload` 字段，也就是**原始命令内容**，
+所以同时发了好几条命令时能看出是哪条挂了。
+主题格式见 [mqtt.md §11](mqtt.md#11-slugcommand_result)。
+
+> **0.3.x 的 Bridge 不发这个主题**，只能去读进程的 stdout。
+> 如果你 `mosquitto_sub` 什么都收不到、而 Bridge 日志里有
+> `command N to ... failed`，那就是版本太老。
+
 ### 7.1 Bridge 收到了吗
 
 日志里必须有：
@@ -692,7 +717,13 @@ mosquitto_pub -t espnow2mqtt/aabbccddeeff/set -m '{"switch":"ON"}'
 ### 7.3 `failed: send_fail`
 
 ```
-WARNING espnow2mqtt: command 7 to AA:BB:CC:DD:EE:FF failed: send_fail
+WARNING espnow2mqtt: command 7 to living_room failed: send_fail
+```
+
+同一条信息也在 MQTT 上，所以不用非得有 Bridge 的 stdout：
+
+```bash
+mosquitto_sub -t 'espnow2mqtt/+/command_result' -v
 ```
 
 **S3 根本没把命令发出去。** `en2m_send_downlink()` 同步返回了错误。
@@ -750,6 +781,11 @@ S3 侧：
 
 **Bridge 对 payload 零校验**，所有校验都在设备侧。要看拒绝原因，
 接 `idf.py monitor` 看设备日志，或者在写回调里加日志。
+
+`command_result` 在这种情况下报的是 **`ok: true`**——
+链路层确实把帧送到了，是应用层拒绝的。
+所以这一条是命令结果主题**唯一抓不到的**失败形式，
+关键操作还得同时校验 `<slug>/state`。
 
 字段和取值的权威表在 [mqtt.md §8](mqtt.md#8-设备状态字段) 和
 device 仓库的 `docs/data-model.md`。
@@ -920,9 +956,9 @@ mosquitto_pub -t espnow2mqtt/bridge/request/permit_join -m 300
 | 消息 | 含义 | 处理 |
 |---|---|---|
 | `devices load failed: <exc>` | `devices.json` 损坏/格式不对 | 删掉重新学（[§9.3](#93-重置设备表)） |
-| `command <id> to <mac> failed: timeout` | 命令重传 4 次无 ACK | [§7.4](#74-failed-timeout) |
-| `command <id> to <mac> failed: send_fail` | S3 没发出去 | [§7.3](#73-failed-send_fail) |
-| `command <id> to <mac> failed: unknown` | `ack` 行里 `ok:false` 但没有 `error` 字段 | 不该出现，固件异常 |
+| `command <id> to <slug> failed: timeout` | 命令重传 4 次无 ACK。同时会发 `<slug>/command_result` | [§7.4](#74-failed-timeout) |
+| `command <id> to <slug> failed: send_fail` | S3 没发出去。同上 | [§7.3](#73-failed-send_fail) |
+| `command <id> to <slug> failed: unknown` | `ack` 行里 `ok:false` 但没有 `error` 字段 | 不该出现，固件异常 |
 | `unknown device slug <slug>` | 往不存在的设备发命令 | [§7.2](#72-unknown-device-slug) |
 
 **ERROR 级**
@@ -939,7 +975,8 @@ mosquitto_pub -t espnow2mqtt/bridge/request/permit_join -m 300
 | `non-json: <line>` | S3 发来的行不是 JSON。**持续刷 = console 配在 USB 上了**（[§2.6](#26-只看到非-json-行)） |
 | `ignored: {...}` | 未知的 `type`，协议向前兼容 |
 | `pong {...}` | `ping` 的响应 |
-| `ack: {...}` | 成功的命令确认 |
+| `command <id> to <slug> acked` | 成功的命令确认。也会发 `<slug>/command_result` |
+| `forgetting unacked command <id>` | 30 s 内没收到 ack，`pending` 条目被清掉。通常意味着协调器中途复位了 |
 
 ### 10.2 S3 转述的日志（`coord:` 前缀）
 

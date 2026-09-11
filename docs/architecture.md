@@ -131,15 +131,27 @@ Bridge 里那一大段 discovery 代码是给"不想装集成、只想用原生 
       超时了 → EN2M_EVENT_ACK_TIMEOUT 事件 → {"type":"ack",...,"ok":false,"error":"timeout"}
 
 ⑦ Bridge：_on_ack
+      从 pending 表取回原始命令内容和耗时
       ok:true  → LOG.debug
-      ok:false → LOG.warning("command 7 to AA:.. failed: timeout")
+      ok:false → LOG.warning("command 7 to living_room failed: timeout")
+      两种都发 <base>/<slug>/command_result（非 retained）
 
-⑧ 与此同时第 ⑤ 步的新状态走完 3 节那条路，HA 里的开关落到 ON
+⑧ HA 集成：订阅 command_result
+      ok:true  → LOG.debug
+      ok:false → 在 HA 事件总线上 fire espnow2mqtt_command_failed
+
+⑨ 与此同时第 ⑤ 步的新状态走完 3 节那条路，HA 里的开关落到 ON
 ```
 
 注意第 ⑤ 步：**设备既回 ACK 又发一份新状态**。ACK 说"我收到了"，
-状态说"我现在是这样"。HA 看到的是后者——这是为什么点了开关之后
-HA 里的状态是**设备真实到达的状态**，而不是乐观更新。
+状态说"我现在是这样"。HA 里那个开关的最终值来自后者——
+这是为什么点了开关之后 HA 显示的是**设备真实到达的状态**，
+而不是乐观更新。
+
+ACK 这条路（⑥⑦⑧）存在的意义是**失败的时候**。
+命令失败不会产生任何新的状态上报，所以没有 ⑦⑧ 的话，
+"命令丢了"和"设备本来就是这个值"在 MQTT 上完全一样。
+主题格式见 [mqtt.md §11](mqtt.md#11-slugcommand_result)。
 
 ## 5. 为什么协调器需要一张 peer 表
 

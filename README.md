@@ -98,11 +98,13 @@ docker compose up -d --build
 | 主题 | 说明 |
 |------|------|
 | `espnow2mqtt/bridge/state` | Bridge online/offline |
+| `espnow2mqtt/bridge/info` | 协调器自述（信道、固件、MAC） |
 | `espnow2mqtt/bridge/devices` | 设备列表 |
 | `espnow2mqtt/bridge/request/permit_join` | 开网（秒） |
 | `espnow2mqtt/<slug>/state` | 设备状态 |
 | `espnow2mqtt/<slug>/set` | 设备控制 |
 | `espnow2mqtt/<slug>/availability` | 设备在线 |
+| `espnow2mqtt/<slug>/command_result` | 一条命令的结局（成功 / 超时 / 发送失败） |
 
 开网：
 
