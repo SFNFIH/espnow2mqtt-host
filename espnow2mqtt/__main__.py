@@ -19,6 +19,11 @@ from serial.tools import list_ports
 
 LOG = logging.getLogger("espnow2mqtt")
 
+#: How long to remember a command while waiting for the coordinator's ack. The
+#: coordinator gives up after EN2M_CMD_RETRIES × EN2M_CMD_RETRY_MS (about 1.2 s)
+#: and acks with "timeout", so anything still pending after this lost its ack.
+PENDING_TTL_S = 30.0
+
 
 @dataclass
 class Device:
@@ -34,6 +39,16 @@ class Device:
     last_state: dict[str, Any] = field(default_factory=dict)
     discovered: bool = False
     discovery_sig: str = ""  # rebuild discovery when caps change
+
+
+@dataclass
+class PendingCommand:
+    """A command handed to the coordinator, awaiting its ack."""
+
+    mac: str
+    slug: str
+    payload: dict[str, Any]
+    sent_at: float
 
 
 
@@ -60,6 +75,10 @@ class Bridge:
         self.devices: dict[str, Device] = {}
         self.ser: Optional[serial.Serial] = None
         self.cmd_id = 1
+        # Commands sent to the coordinator that have not been acked yet, keyed
+        # by command id. Lets an ack be attributed back to a device even when
+        # the ack itself is a bare "timeout" with no payload.
+        self.pending: dict[int, PendingCommand] = {}
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
@@ -218,15 +237,59 @@ class Bridge:
             LOG.debug("ignored: %s", msg)
 
     def _on_ack(self, msg: dict[str, Any]) -> None:
-        if msg.get("ok"):
-            LOG.debug("ack: %s", msg)
+        """Republish the coordinator's verdict on a command as MQTT.
+
+        Downlinks used to be write-only: the coordinator's ack was logged here
+        and went no further, so a command that timed out looked identical to one
+        that worked from anywhere outside this process. Home Assistant now has
+        something to subscribe to.
+        """
+        cid = msg.get("id")
+        ok = bool(msg.get("ok"))
+        error = str(msg.get("error") or "") or None
+        pending = self.pending.pop(cid, None) if isinstance(cid, int) else None
+        self._expire_pending()
+
+        mac = str(msg.get("mac") or (pending.mac if pending else ""))
+        dev = self.devices.get(mac)
+        slug = self._slug(dev) if dev else (pending.slug if pending else "")
+
+        if ok:
+            LOG.debug("command %s to %s acked", cid, slug or mac or "?")
+        else:
+            LOG.warning(
+                "command %s to %s failed: %s", cid, slug or mac or "?", error or "unknown"
+            )
+
+        if not slug:
+            # An ack for something we cannot attribute — most likely a command
+            # issued from the coordinator's own console rather than from us.
             return
-        LOG.warning(
-            "command %s to %s failed: %s",
-            msg.get("id"),
-            msg.get("mac"),
-            msg.get("error") or "unknown",
+        result: dict[str, Any] = {"id": cid, "ok": ok, "mac": mac or None}
+        if error:
+            result["error"] = error
+        if pending is not None:
+            result["payload"] = pending.payload
+            result["elapsed_ms"] = int((time.time() - pending.sent_at) * 1000)
+        self.mqtt.publish(
+            f"{self.base}/{slug}/command_result",
+            json.dumps(result),
+            retain=False,
         )
+
+    def _expire_pending(self) -> None:
+        """Forget commands the coordinator never acked.
+
+        It always should — it acks with `timeout` once the retries run out — but
+        a coordinator reset mid-command would otherwise leak an entry forever.
+        """
+        if not self.pending:
+            return
+        deadline = time.time() - PENDING_TTL_S
+        stale = [cid for cid, p in self.pending.items() if p.sent_at < deadline]
+        for cid in stale:
+            LOG.debug("forgetting unacked command %s", cid)
+            del self.pending[cid]
 
     def _ensure_device(self, mac: str) -> Device:
         if mac not in self.devices:
@@ -286,13 +349,18 @@ class Bridge:
                 self._publish_discovery(dev)
         self._save_devices()
 
-    def _parse_caps(self, payload: dict[str, Any], model: str = "") -> list[str]:
+    @staticmethod
+    def _explicit_caps(payload: dict[str, Any]) -> list[str]:
+        """The caps the device stated outright, if the report had room for them."""
         caps_raw = payload.get("caps")
-        caps: list[str] = []
         if isinstance(caps_raw, list):
-            caps = [str(c).strip().lower() for c in caps_raw if str(c).strip()]
-        elif isinstance(caps_raw, str) and caps_raw.strip():
-            caps = [c.strip().lower() for c in caps_raw.split(",") if c.strip()]
+            return [str(c).strip().lower() for c in caps_raw if str(c).strip()]
+        if isinstance(caps_raw, str) and caps_raw.strip():
+            return [c.strip().lower() for c in caps_raw.split(",") if c.strip()]
+        return []
+
+    def _parse_caps(self, payload: dict[str, Any], model: str = "") -> list[str]:
+        caps = self._explicit_caps(payload)
         if caps:
             return caps
         # Infer from payload keys / model
@@ -312,6 +380,28 @@ class Bridge:
                 inferred = ["switch"]
         return inferred
 
+    def _update_caps(self, dev: Device, payload: dict[str, Any]) -> None:
+        """Fold a report's capabilities into what we already knew.
+
+        A device drops `caps` from its report when the 160-byte budget gets
+        tight, and what we can infer from the remaining keys is much coarser
+        than what the firmware would have told us. Replacing the stored caps
+        with that guess used to make capabilities flicker — a light would be
+        downgraded to a plain switch for one report. So only an explicit list
+        may replace; a guess may only add.
+        """
+        explicit = self._explicit_caps(payload)
+        if explicit:
+            new_caps = explicit
+        else:
+            new_caps = list(dev.caps)
+            for cap in self._parse_caps(payload, dev.model):
+                if cap not in new_caps:
+                    new_caps.append(cap)
+        if new_caps != dev.caps:
+            dev.caps = new_caps
+            dev.discovered = False
+
     def _on_state(self, msg: dict[str, Any]) -> None:
         mac = msg.get("mac", "")
         if not mac:
@@ -329,10 +419,7 @@ class Bridge:
             payload = {"value": payload}
         if payload.get("node_role"):
             dev.node_role = str(payload["node_role"])
-        new_caps = self._parse_caps(payload, dev.model)
-        if new_caps and new_caps != dev.caps:
-            dev.caps = new_caps
-            dev.discovered = False
+        self._update_caps(dev, payload)
         if not dev.online:
             dev.online = True
             self._publish_discovery(dev)
@@ -411,6 +498,10 @@ class Bridge:
                 payload = {"switch": raw.strip().upper()}
             cid = self.cmd_id
             self.cmd_id += 1
+            self.pending[cid] = PendingCommand(
+                mac=dev.mac, slug=slug, payload=payload, sent_at=time.time()
+            )
+            self._expire_pending()
             self._serial_write(
                 {"type": "cmd", "mac": dev.mac, "id": cid, "payload": payload}
             )
